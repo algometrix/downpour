@@ -119,6 +119,17 @@ test("the video button picks the frame's stream for blob players", () => {
   assert.equal(rules.pickVideoSource([], { src: "blob:x", frameId: 0 }), null);
 });
 
+test("the video button prefers the frame's stream that lists qualities", () => {
+  const entries = [
+    { kind: "stream", format: "hls", url: "https://cdn.example/v/720.m3u8?t=2", heights: [], frameId: 7 },
+    { kind: "stream", format: "hls", url: "https://cdn.example/v/master.m3u8", heights: [1080, 720], frameId: 7 },
+    { kind: "stream", format: "hls", url: "https://cdn.example/ad/master.m3u8", heights: [480], frameId: 0 },
+  ];
+  assert.equal(rules.pickVideoSource(entries, { src: "blob:x", frameId: 7 }).url, "https://cdn.example/v/master.m3u8");
+  const unread = entries.slice(0, 1);
+  assert.equal(rules.pickVideoSource(unread, { src: "blob:x", frameId: 7 }).url, "https://cdn.example/v/720.m3u8?t=2");
+});
+
 test("the video button uses plain media addresses directly", () => {
   assert.deepEqual(rules.pickVideoSource([], { src: "https://cdn.example/v/clip.mp4", frameId: 0 }), {
     kind: "file",
@@ -356,4 +367,200 @@ test("a notice is drawn only into the site the download came from", () => {
   assert.equal(rules.sameOrigin("https://host.example/", "http://host.example/"), false, "scheme counts");
   assert.equal(rules.sameOrigin("about:blank", "about:blank"), false);
   assert.equal(rules.sameOrigin(undefined, "https://host.example/"), false);
+});
+
+test("a stream read again gets its qualities and hides its variants", () => {
+  const variant = { kind: "stream", url: "https://cdn.example/v/720.m3u8", heights: [] };
+  const master = { kind: "stream", url: "https://cdn.example/v/master.m3u8", playlistKind: "unknown", heights: [], variantUrls: [] };
+  const file = { kind: "file", url: "https://cdn.example/clip.mp4" };
+  const playlist = { kind: "multivariant", heights: [1080, 720], variantUrls: [variant.url] };
+  assert.deepEqual(rules.withPlaylistRead([variant, master, file], master.url, playlist), [
+    { ...master, playlistKind: "multivariant", heights: [1080, 720], variantUrls: [variant.url] },
+    file,
+  ]);
+  const media = { kind: "media", heights: [], variantUrls: ["https://cdn.example/v/seg.ts"] };
+  assert.deepEqual(rules.withPlaylistRead([master], master.url, media)[0].variantUrls, [], "a media playlist hides nothing");
+  assert.equal(rules.withPlaylistRead([file], master.url, playlist), null, "the stream is gone");
+  const read = rules.withPlaylistRead([master], master.url, playlist);
+  assert.equal(rules.withPlaylistRead(read, master.url, playlist), null, "a second read with the same result changes nothing");
+});
+
+test("a refused multivariant playlist is the one read again, not its variants", () => {
+  const master = { kind: "stream", url: "https://cdn.example/v/master.m3u8", playlistKind: "unknown", heights: [], frameId: 7 };
+  const refusedVariant = { kind: "stream", url: "https://cdn.example/v/720.m3u8", playlistKind: "unknown", heights: [], frameId: 7 };
+  const readVariant = { ...refusedVariant, url: "https://cdn.example/v/480.m3u8", playlistKind: "media" };
+  assert.equal(rules.streamToReread([readVariant, refusedVariant, master], 7), master);
+  assert.equal(rules.streamToReread([readVariant], 7), null, "a media playlist read fine");
+  const listed = { ...master, playlistKind: "multivariant", heights: [1080] };
+  assert.equal(rules.streamToReread([refusedVariant, listed], 7), null, "the qualities are known");
+  assert.equal(rules.needsPlaylistRead({ kind: "stream", url: "https://cdn.example/v/index.m3u8" }), true, "never read");
+  assert.equal(rules.needsPlaylistRead({ kind: "file", url: "https://cdn.example/clip.mp4" }), false);
+});
+
+test("a source counts as detected only where it was seen loading", () => {
+  const entries = [
+    { kind: "stream", url: "https://cdn.example/v/master.m3u8", frameId: 7 },
+    { kind: "file", url: "https://cdn.example/clip.mp4", frameId: 0 },
+  ];
+  assert.equal(rules.isDetectedInFrame(entries, entries[0], 7), true);
+  assert.equal(rules.isDetectedInFrame(entries, entries[0], 0), false, "the same address in another frame");
+  assert.equal(rules.isDetectedInFrame(entries, entries[1], 0), true, "a file");
+  assert.equal(rules.isDetectedInFrame(entries, { kind: "file", url: "https://cdn.example/other.mp4" }, 0), false, "only guessed from the video's address");
+  assert.equal(rules.isDetectedInFrame(entries, null, 0), false);
+});
+
+test("a frame without its own address refers to the page", () => {
+  assert.equal(rules.frameReferrer("https://player.example/embed/1", "https://site.example/"), "https://player.example/embed/1");
+  assert.equal(rules.frameReferrer("about:blank", "https://site.example/"), "https://site.example/");
+  assert.equal(rules.frameReferrer(undefined, "https://site.example/"), "https://site.example/");
+});
+
+test("our playlist read sends the page's Referer and Origin", () => {
+  const ours = [
+    { name: "Accept", value: "*/*" },
+    { name: "Origin", value: "moz-extension://abc" },
+  ];
+  assert.deepEqual(rules.withPageHeaders(ours, { sentReferer: "https://player.example/embed/1", origin: "https://player.example" }), [
+    { name: "Accept", value: "*/*" },
+    { name: "Referer", value: "https://player.example/embed/1" },
+    { name: "Origin", value: "https://player.example" },
+  ]);
+  assert.deepEqual(rules.withPageHeaders(ours, { sentReferer: "https://player.example/" }), [
+    { name: "Accept", value: "*/*" },
+    { name: "Origin", value: "moz-extension://abc" },
+    { name: "Referer", value: "https://player.example/" },
+  ], "a header the page did not send stays ours");
+  const odd = [{ name: "Constructor", value: "1" }, { name: "__proto__", value: "2" }];
+  assert.deepEqual(rules.withPageHeaders(odd, {}), odd, "any header name is kept");
+});
+
+test("a refused playlist is read again a few times, spaced out, per tab", () => {
+  let now = 0;
+  const budget = rules.createRereadBudget({ limit: 2, gapMs: 3000, clock: () => now });
+  const url = "https://cdn.example/v/master.m3u8";
+  assert.equal(budget.take(7, url), true);
+  assert.equal(budget.take(7, url), false, "too soon");
+  now = 3000;
+  assert.equal(budget.take(7, url), true);
+  now = 60_000;
+  assert.equal(budget.take(7, url), false, "the limit is reached");
+  assert.equal(budget.take(8, url), true, "another tab has its own count");
+  budget.forget(7);
+  assert.equal(budget.take(7, url), true, "a new page starts over");
+});
+
+test("an unlisted playlist read once keeps its qualities on later asks", () => {
+  const memo = rules.createPlaylistMemo();
+  const url = "https://cdn.example/v/index.m3u8";
+  const playlist = { kind: "multivariant", heights: [720, 480], variantUrls: [] };
+  assert.equal(memo.recall(7, url), undefined);
+  memo.remember(7, url, playlist);
+  assert.equal(memo.recall(7, url), playlist);
+  assert.equal(memo.recall(8, url), undefined, "per tab");
+  memo.forget(7);
+  assert.equal(memo.recall(7, url), undefined, "a new page starts over");
+});
+
+test("a Referer cut to the site gives way to the tab's page on that site", () => {
+  const page = "https://host.example/file/abc123/clip.mp4";
+  assert.equal(rules.downloadPage("https://host.example/", page), page);
+  assert.equal(rules.downloadPage("https://host.example/", "https://other.example/x"), "https://host.example/");
+  assert.equal(rules.downloadPage("https://host.example/watch/1", page), "https://host.example/watch/1", "a full Referer wins");
+  assert.equal(rules.downloadPage("https://host.example/", undefined), "https://host.example/");
+  assert.equal(rules.downloadPage(undefined, page), undefined, "no Referer: the tab may be unrelated");
+  assert.equal(rules.downloadPage("https://host.example/", "about:blank"), "https://host.example/");
+});
+
+test("addresses of this computer are local", () => {
+  for (const url of ["http://localhost:8096/v.mp4", "http://app.localhost/", "http://127.0.0.1/", "http://127.1/", "http://[::1]:8080/", "http://0.0.0.0/"]) {
+    assert.equal(rules.isLocalAddress(url), true, url);
+  }
+  for (const url of ["https://example.com/", "http://192.168.1.5/", "http://localhost.example.com/", undefined, "about:blank"]) {
+    assert.equal(rules.isLocalAddress(url), false, String(url));
+  }
+});
+
+test("videos from this computer stay in the browser unless turned on", () => {
+  const local = { url: "http://127.0.0.1:8096/movie.mp4" };
+  assert.equal(rules.shouldCapture(local, {}).capture, false);
+  assert.equal(rules.shouldCapture(local, { captureLocalVideos: true }).capture, true);
+  assert.equal(rules.shouldCapture({ url: "http://localhost/setup.exe" }, {}).capture, true, "only videos");
+  assert.equal(rules.shouldCapture({ url: "https://example.com/movie.mp4" }, {}).capture, true);
+});
+
+test("a video from, or playing on, this computer is ignored by default", () => {
+  assert.equal(rules.isIgnoredLocalVideo("http://localhost/live.m3u8", "https://site.example/", {}), true);
+  assert.equal(rules.isIgnoredLocalVideo("https://cdn.example/v.mp4", "http://localhost:3000/", {}), true);
+  assert.equal(rules.isIgnoredLocalVideo("https://cdn.example/v.mp4", "https://site.example/", {}), false);
+  assert.equal(rules.isIgnoredLocalVideo("http://localhost/v.mp4", "http://localhost/", { captureLocalVideos: true }), false);
+});
+
+test("a video is named after its page's title", () => {
+  assert.equal(rules.videoTitle("  Rome at night "), "Rome at night");
+  assert.equal(rules.videoTitle(""), undefined);
+  assert.equal(rules.videoTitle(undefined), undefined);
+});
+
+test("a page's title names a linked stream, never a linked file", () => {
+  assert.equal(rules.linkTitle("https://site.example/ep1.mp4", "Season 1"), undefined);
+  assert.equal(rules.linkTitle("https://cdn.example/v/master.m3u8", " Rome "), "Rome");
+  assert.equal(rules.linkTitle("https://cdn.example/v/master.m3u8", ""), undefined);
+});
+
+test("a download takes the title of the tab only while it shows the starting site", () => {
+  const tab = { url: "https://site.example/watch/3", title: " Rome " };
+  assert.equal(rules.startingPageTitle(tab, "https://site.example/"), "Rome");
+  assert.equal(rules.startingPageTitle({ url: "about:newtab", title: "New Tab" }, "https://site.example/"), undefined);
+  assert.equal(rules.startingPageTitle(undefined, "https://site.example/"), undefined);
+});
+
+test("only video responses are videos for the local video setting", () => {
+  assert.equal(rules.isVideoMime("video/mp4"), true);
+  assert.equal(rules.isVideoMime("audio/mpeg"), false);
+  assert.equal(rules.isVideoMime(undefined), false);
+});
+
+const box = (width, height, left = 0, top = 0) => ({ width, height, left, top, right: left + width, bottom: top + height });
+
+test("the button sits in a large video, or in the player around a hidden one", () => {
+  assert.equal(rules.videoBoxChoice(box(640, 360), []), -1);
+  assert.equal(rules.videoBoxChoice(box(160, 90), [box(800, 450)]), null, "a thumbnail gets none");
+  assert.equal(rules.videoBoxChoice(box(0, 0), [box(100, 20), box(800, 450)]), 1, "nearest large player");
+  assert.equal(rules.videoBoxChoice(box(0, 0), [box(100, 20)]), null);
+});
+
+test("the main video is the largest, and the first wins a tie", () => {
+  assert.equal(rules.largestBox([box(400, 300), box(800, 450), box(800, 450)]), 1);
+  assert.equal(rules.largestBox([]), -1);
+  assert.equal(rules.largestBox([box(0, 0)]), -1);
+});
+
+test("the button stays inside the visible width", () => {
+  const options = { width: 40, visibleWidth: 1000, scroll: { x: 0, y: 100 }, gap: 8 };
+  assert.deepEqual(rules.videoButtonPosition(box(640, 360, 100, 50), options), { left: 692, top: 158 });
+  // Wider than the window: the right edge is the window's, not the video's.
+  assert.deepEqual(rules.videoButtonPosition(box(1600, 900, 0, 0), options).left, 952);
+  // Starting near the right edge and cut off there: still inside the window.
+  assert.equal(rules.videoButtonPosition(box(620, 360, 980, 0), options).left, 952);
+  // Cut off on the left: at the visible part's right corner.
+  assert.equal(rules.videoButtonPosition(box(640, 360, -500, 0), options).left, 92);
+  // In fullscreen there is no scroll.
+  assert.deepEqual(rules.videoButtonPosition(box(1920, 1080), { ...options, visibleWidth: 1920, scroll: { x: 0, y: 0 } }), { left: 1872, top: 8 });
+});
+
+test("the button rests on the main video, but hides elsewhere and in fullscreen", () => {
+  assert.equal(rules.videoButtonHidesWhenLeft({ menuOpen: false, onMainVideo: true, fullscreen: false }), false);
+  assert.equal(rules.videoButtonHidesWhenLeft({ menuOpen: false, onMainVideo: false, fullscreen: false }), true);
+  assert.equal(rules.videoButtonHidesWhenLeft({ menuOpen: false, onMainVideo: true, fullscreen: true }), true);
+  assert.equal(rules.videoButtonHidesWhenLeft({ menuOpen: true, onMainVideo: false, fullscreen: true }), false, "an open menu keeps it");
+  assert.equal(rules.videoButtonReturnsToMain({ leftMainVideo: false, fullscreen: false }), true);
+  assert.equal(rules.videoButtonReturnsToMain({ leftMainVideo: true, fullscreen: false }), false);
+  assert.equal(rules.videoButtonReturnsToMain({ leftMainVideo: false, fullscreen: true }), false);
+});
+
+test("fullscreen hides the button later; leaving it brings the button back to the main video", () => {
+  assert.equal(rules.videoButtonOnFullscreen({ fullscreen: true, showing: true, onMainVideo: true }), "hide-later");
+  assert.equal(rules.videoButtonOnFullscreen({ fullscreen: false, showing: true, onMainVideo: true }), "stay");
+  assert.equal(rules.videoButtonOnFullscreen({ fullscreen: false, showing: false, onMainVideo: false }), "show-main");
+  assert.equal(rules.videoButtonOnFullscreen({ fullscreen: false, showing: true, onMainVideo: false }), "nothing");
 });

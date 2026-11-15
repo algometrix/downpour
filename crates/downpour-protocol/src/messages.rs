@@ -8,6 +8,10 @@ pub struct BrowserDownload {
     pub url: String,
     #[serde(default)]
     pub file_name: Option<String>,
+    /// A name a person typed, as with `downpour-cli send --name`. It is kept
+    /// literally, where a browser's `file_name` is cleaned of web escapes.
+    #[serde(default)]
+    pub typed_name: Option<String>,
     #[serde(default)]
     pub referrer: Option<String>,
     /// `Cookie` header value for `url`.
@@ -29,6 +33,12 @@ pub struct BrowserDownload {
     /// The page's title, used to name video streams.
     #[serde(default)]
     pub title: Option<String>,
+    /// The title of the page a video file plays on, which names the file.
+    /// Sent only when that page names this video: not for a link merely
+    /// listed on the page. Add-ons before it did not send it, and their
+    /// `title` never named a file.
+    #[serde(default)]
+    pub video_title: Option<String>,
     /// The page the download was found on.
     #[serde(default)]
     pub page_url: Option<String>,
@@ -146,6 +156,17 @@ mod tests {
         assert_eq!(items[0].page_url.as_deref(), Some("https://site/watch/3"));
         assert_eq!(items[0].accept_language.as_deref(), Some("en-US"));
         assert_eq!(items[0].quality, None);
+    }
+
+    #[test]
+    fn a_video_files_page_title_comes_apart_from_a_streams() {
+        let json = r#"{"type":"download","items":[{"url":"https://cdn/v/clip.mp4",
+            "videoTitle":"Rome at night"}]}"#;
+        let ExtensionRequest::Download { items } = serde_json::from_str(json).unwrap() else {
+            panic!("wrong variant")
+        };
+        assert_eq!(items[0].video_title.as_deref(), Some("Rome at night"));
+        assert_eq!(items[0].title, None);
     }
 
     #[test]

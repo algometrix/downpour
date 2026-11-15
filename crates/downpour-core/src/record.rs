@@ -188,9 +188,23 @@ pub struct DownloadRecord {
     pub position: u64,
     #[serde(default)]
     pub speed_limit: DownloadLimit,
+    /// A name the user chose before the download finished. The transfer
+    /// keeps writing under `target`; the file takes this name once complete.
+    #[serde(default)]
+    pub name_when_finished: Option<FileName>,
 }
 
 impl DownloadRecord {
+    /// Where the file is, once the download finished.
+    pub fn finished_file(&self) -> Option<&Path> {
+        finished_file(&self.status, self.target.as_deref())
+    }
+
+    /// The name to show: the one the user chose, even before the file has it.
+    pub fn shown_name(&self) -> &FileName {
+        self.name_when_finished.as_ref().unwrap_or(&self.file_name)
+    }
+
     pub fn directory(&self, categories: &Categories) -> PathBuf {
         match &self.target {
             Some(target) => target.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -216,4 +230,42 @@ pub fn track_path(target: &Path, index: usize) -> PathBuf {
     let mut path = target.as_os_str().to_owned();
     path.push(format!(".track{index}.dppart"));
     PathBuf::from(path)
+}
+
+/// The part file and any stream track files a download saving to `target`
+/// writes before it finishes.
+pub fn unfinished_files(target: &Path) -> Vec<PathBuf> {
+    std::iter::once(part_path(target))
+        .chain((0..MAX_STREAM_TRACKS).map(|index| track_path(target, index)))
+        .collect()
+}
+
+/// A download's file counts as there to open or rename only once the
+/// download finished; before that `target` is a reserved name.
+pub(crate) fn finished_file<'a>(
+    status: &DownloadStatus,
+    target: Option<&'a Path>,
+) -> Option<&'a Path> {
+    match status {
+        DownloadStatus::Completed => target,
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_finished_download_has_its_file_there() {
+        let file = Path::new("downloads/clip.mp4");
+        assert_eq!(
+            finished_file(&DownloadStatus::Completed, Some(file)),
+            Some(file)
+        );
+        assert_eq!(finished_file(&DownloadStatus::Completed, None), None);
+        // A restarted download keeps its reserved name but has no file yet.
+        assert_eq!(finished_file(&DownloadStatus::Queued, Some(file)), None);
+        assert_eq!(finished_file(&DownloadStatus::Paused, Some(file)), None);
+    }
 }

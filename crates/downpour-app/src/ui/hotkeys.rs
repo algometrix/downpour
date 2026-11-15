@@ -92,6 +92,9 @@ pub const OPEN_FILE: Hotkey = Hotkey::plain(Key::Enter, "Enter");
 pub const SHOW_IN_FOLDER: Hotkey = Hotkey::plain(Key::O, "O");
 pub const COPY_ADDRESS: Hotkey = Hotkey::plain(Key::C, "C");
 pub const REMOVE: Hotkey = Hotkey::plain(Key::Delete, "Del");
+/// Renames a download's file: now if finished, otherwise when it finishes,
+/// as F2 does in Explorer.
+pub const RENAME: Hotkey = Hotkey::plain(Key::F2, "F2");
 pub const NEXT: Hotkey = Hotkey::plain(Key::ArrowDown, "↓");
 pub const PREVIOUS: Hotkey = Hotkey::plain(Key::ArrowUp, "↑");
 pub const DESELECT: Hotkey = Hotkey::plain(Key::Escape, "Esc");
@@ -106,6 +109,10 @@ pub const CANCEL: Hotkey = Hotkey::plain(Key::Escape, "Esc");
 pub const DIALOG_START: Hotkey = Hotkey::plain(Key::S, "S");
 pub const DIALOG_LATER: Hotkey = Hotkey::plain(Key::L, "L");
 pub const DIALOG_CANCEL: Hotkey = Hotkey::plain(Key::C, "C");
+
+/// Confirms removing a download. Not `REMOVE`'s Del: holding that key to open
+/// the dialog would repeat and delete straight away.
+pub const CONFIRM_REMOVE: Hotkey = Hotkey::plain(Key::Enter, "Enter");
 
 /// A shortcut the main window acts on this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +130,7 @@ pub enum Command {
     ShowInFolder,
     CopyAddress,
     Remove,
+    Rename,
     Next,
     Previous,
     Deselect,
@@ -130,7 +138,7 @@ pub enum Command {
     MoveDown,
 }
 
-const BINDINGS: [(Hotkey, Command); 18] = [
+const BINDINGS: [(Hotkey, Command); 19] = [
     (ADD_URL, Command::AddUrl),
     (ADD_LINKS, Command::AddLinks),
     (PAUSE_ALL, Command::PauseAll),
@@ -144,6 +152,7 @@ const BINDINGS: [(Hotkey, Command); 18] = [
     (SHOW_IN_FOLDER, Command::ShowInFolder),
     (COPY_ADDRESS, Command::CopyAddress),
     (REMOVE, Command::Remove),
+    (RENAME, Command::Rename),
     (NEXT, Command::Next),
     (PREVIOUS, Command::Previous),
     (DESELECT, Command::Deselect),

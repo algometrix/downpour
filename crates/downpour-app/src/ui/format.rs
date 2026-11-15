@@ -7,6 +7,12 @@ use downpour_core::limiter::{kib_to_bytes_per_second, DownloadLimit};
 
 pub use downpour_core::units::{bytes, duration, speed};
 
+/// Share done as a whole percent, rounded down: a download with bytes still
+/// to come never reads 100%.
+pub fn percent(fraction: f32) -> String {
+    format!("{}%", (fraction.clamp(0.0, 1.0) * 100.0).floor() as u8)
+}
+
 /// "1.0 MB/s" for a limit given in KiB per second.
 pub fn kib_rate(kib_per_second: NonZeroU32) -> String {
     speed(kib_to_bytes_per_second(kib_per_second))
@@ -72,6 +78,14 @@ pub fn extension_badge(file_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_download_with_bytes_to_come_never_reads_a_full_percent() {
+        assert_eq!(percent(0.9989), "99%");
+        assert_eq!(percent(1.0), "100%");
+        assert_eq!(percent(0.0), "0%");
+        assert_eq!(percent(0.505), "50%");
+    }
 
     #[test]
     fn describes_a_downloads_speed_limit() {

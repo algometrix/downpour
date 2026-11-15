@@ -8,8 +8,8 @@ use downpour_core::settings::CONNECTION_RANGE;
 use downpour_core::stream::mux::locate_ffmpeg;
 use downpour_core::stream::{StreamError, StreamFormat, StreamOffer, VideoQuality};
 use downpour_core::{
-    Categories, Category, CategoryId, CategoryLook, DownloadId, DownloadKind, EngineSettings,
-    FileName, FileNameSource, NewDownload, Queue, QueueId, RemoveFiles, RequestContext, StartMode,
+    Categories, Category, CategoryId, CategoryLook, DownloadId, DownloadKind, DownloadView,
+    EngineSettings, NewDownload, Queue, QueueId, RemoveFiles, RequestContext, StartMode,
 };
 use eframe::egui::{self, vec2, Align, Key, Layout, Ui};
 use url::Url;
@@ -42,6 +42,7 @@ pub enum Dialog {
     Settings(SettingsForm),
     Categories(CategoriesForm),
     Queue(QueueForm),
+    RenameFile(RenameFileForm),
     LinkGrabber(LinkGrabberForm),
 }
 
@@ -77,6 +78,10 @@ pub enum DialogCommand {
         id: QueueId,
         name: String,
         max_active: u8,
+    },
+    RenameFile {
+        id: DownloadId,
+        name: String,
     },
     RegisterBrowserIntegration,
     AddToFirefox,
@@ -258,6 +263,28 @@ impl RemoveForm {
             name,
             completed,
             delete_file: false,
+        }
+    }
+}
+
+/// Renames a download's file in its folder: now if it is finished, or once
+/// the download finishes.
+pub struct RenameFileForm {
+    id: DownloadId,
+    name: String,
+    folder: String,
+    finished: bool,
+    pub error: Option<String>,
+}
+
+impl RenameFileForm {
+    pub fn for_download(download: &DownloadView) -> Self {
+        Self {
+            id: download.id,
+            name: download.file_name.clone(),
+            folder: download.directory.display().to_string(),
+            finished: download.finished_file().is_some(),
+            error: None,
         }
     }
 }
@@ -484,6 +511,7 @@ impl Dialog {
             | Dialog::Settings(_)
             | Dialog::Categories(_)
             | Dialog::Queue(_)
+            | Dialog::RenameFile(_)
             | Dialog::LinkGrabber(_) => Presentation::OverMainWindow,
         }
     }
@@ -984,6 +1012,7 @@ fn body(
             Dialog::Settings(form) => settings(ui, form),
             Dialog::Categories(form) => categories(ui, form),
             Dialog::Queue(form) => queue(ui, form),
+            Dialog::RenameFile(form) => rename_file(ui, form),
             Dialog::LinkGrabber(form) => {
                 link_grabber::show(ui, form, queues).map(|command| match command {
                     LinkGrabberCommand::Close => DialogCommand::Close,
@@ -1432,22 +1461,7 @@ fn quality_picker(ui: &mut Ui, stream: &mut StreamChoice) {
 }
 
 fn browser_request(form: &BrowserForm, start: StartMode) -> NewDownload {
-    let typed = form.file_name.trim();
-    let file_name = match (&form.stream, form.link.browser_file_name()) {
-        (Some(_), _) if !typed.is_empty() => Some(FileName::new(typed, FileNameSource::Browser)),
-        (Some(_), _) => None,
-        // The user edited the browser's suggestion.
-        (None, Some(suggested)) if suggested != typed && !typed.is_empty() => {
-            Some(FileName::new(typed, FileNameSource::User))
-        }
-        (None, Some(suggested)) => Some(FileName::new(suggested, FileNameSource::Browser)),
-        (None, None)
-            if !typed.is_empty() && typed != FileName::guess_from_url(form.link.url()).value =>
-        {
-            Some(FileName::new(typed, FileNameSource::User))
-        }
-        (None, None) => None,
-    };
+    let file_name = form.link.requested_name(&form.file_name);
     let kind = match &form.stream {
         Some(stream) => DownloadKind::Stream {
             format: stream.format,
@@ -1621,23 +1635,74 @@ fn remove(ui: &mut Ui, form: &mut RemoveForm) -> Option<DialogCommand> {
         .wrap(),
     );
     ui.add_space(8.0);
-    if form.completed {
+    let delete_file_box = form.completed.then(|| {
         ui.checkbox(
             &mut form.delete_file,
             "Also delete the downloaded file from disk",
-        );
-    } else {
+        )
+    });
+    if !form.completed {
         hint(ui, "Partially downloaded data will be deleted.");
     }
+    let delete_file_focused = delete_file_box.is_some_and(|checkbox| checkbox.has_focus());
     let mut command = None;
     footer(ui, |ui| {
-        if button(ui, ButtonKind::Danger, Some(Icon::Trash), "Remove").clicked() {
+        let confirm = button(
+            ui,
+            ButtonKind::Danger,
+            Some(Icon::Trash),
+            &hotkeys::CONFIRM_REMOVE.label("Remove"),
+        );
+        let cancel = button(
+            ui,
+            ButtonKind::Secondary,
+            None,
+            &hotkeys::CANCEL.label("Cancel"),
+        );
+        // Enter also clicks a button the user tabbed to, so Cancel goes first.
+        if cancel.clicked() {
+            command = Some(DialogCommand::Close);
+            return;
+        }
+        // On the checkbox, Enter toggles it and must not delete anything.
+        let confirmed = !delete_file_focused && hotkeys::CONFIRM_REMOVE.pressed(ui.ctx());
+        if confirm.clicked() || confirmed {
             let files = if form.delete_file {
                 RemoveFiles::Delete
             } else {
                 RemoveFiles::Keep
             };
             command = Some(DialogCommand::Remove { id: form.id, files });
+        }
+    });
+    command
+}
+
+fn rename_file(ui: &mut Ui, form: &mut RenameFileForm) -> Option<DialogCommand> {
+    let subtitle = if form.finished {
+        format!("The file keeps its place in {}.", form.folder)
+    } else {
+        format!(
+            "When the download finishes, the file gets this name in {}.",
+            form.folder
+        )
+    };
+    title(ui, "Rename file", &subtitle);
+    field_label(ui, "Name");
+    let name_field = text_field(ui, &mut form.name, "File name", None, ui.available_width());
+    if ui.memory(|memory| memory.focused().is_none()) {
+        name_field.request_focus();
+    }
+    let submitted =
+        name_field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    error_text(ui, &form.error);
+    let mut command = None;
+    footer(ui, |ui| {
+        if button(ui, ButtonKind::Primary, Some(Icon::Check), "Rename").clicked() || submitted {
+            command = Some(DialogCommand::RenameFile {
+                id: form.id,
+                name: form.name.clone(),
+            });
         }
         if button(
             ui,
@@ -2153,6 +2218,7 @@ fn settings_card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use downpour_core::{FileName, FileNameSource};
     use downpour_protocol::messages::{BrowserDownload, QualityPick};
 
     #[test]
@@ -2295,5 +2361,150 @@ mod tests {
         // Room for eight, but eight and one would strand the last swatch.
         let grid = swatch_grid(8.0 * 94.0 + 7.0 * SWATCH_GAP, 94.0, 9);
         assert_eq!(grid.per_row, 5);
+    }
+
+    fn requested_with_name_box(link: BrowserLink, typed: Option<&str>) -> Option<FileName> {
+        let mut form = BrowserForm::new(link, &EngineSettings::default());
+        if let Some(typed) = typed {
+            form.file_name = typed.into();
+        }
+        browser_request(&form, StartMode::Queue).file_name
+    }
+
+    #[test]
+    fn the_name_box_decides_the_name_and_where_it_came_from() {
+        use crate::browser_link::tests::item;
+        let browser_named = |name: &str| {
+            Some(FileName {
+                value: name.into(),
+                source: FileNameSource::Browser,
+            })
+        };
+        let file = BrowserLink::parse(BrowserDownload {
+            file_name: Some("My%20Movie.mp4".into()),
+            ..item("https://cdn.example/get?id=7")
+        })
+        .unwrap();
+        let stream = BrowserLink::parse(BrowserDownload {
+            title: Some("My%20Scene".into()),
+            ..item("https://cdn.example/v/master.m3u8")
+        })
+        .unwrap();
+        for (link, clean_name) in [(file, "My Movie.mp4"), (stream, "My Scene")] {
+            let untouched = requested_with_name_box(link.clone(), None);
+            assert_eq!(untouched, browser_named(clean_name));
+
+            let cleared = requested_with_name_box(link.clone(), Some("  "));
+            assert_eq!(cleared, browser_named(clean_name));
+
+            let edited = requested_with_name_box(link, Some("50%20off.mp4"));
+            assert_eq!(
+                edited,
+                Some(FileName {
+                    value: "50%20off.mp4".into(),
+                    source: FileNameSource::User,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_without_a_name_leaves_it_to_the_engine_until_edited() {
+        use crate::browser_link::tests::link;
+        for url in [
+            "https://cdn.example/clip.mp4",
+            "https://cdn.example/v/master.m3u8",
+        ] {
+            assert_eq!(requested_with_name_box(link(url), None), None);
+            assert_eq!(requested_with_name_box(link(url), Some("")), None);
+            let edited = requested_with_name_box(link(url), Some("mine")).unwrap();
+            assert_eq!(edited.source, FileNameSource::User);
+        }
+    }
+
+    fn key_press(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Runs the remove dialog for one frame per entry in `frames`, each with
+    /// those key presses, and returns what the last frame decided.
+    fn remove_dialog_after(
+        form: &mut RemoveForm,
+        frames: &[&[egui::Key]],
+    ) -> Option<DialogCommand> {
+        let ctx = egui::Context::default();
+        theme::install(&ctx, swatch_look(ColorTheme::default()));
+        let mut command = None;
+        for keys in frames {
+            let input = egui::RawInput {
+                events: keys.iter().map(|key| key_press(*key)).collect(),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| command = remove(ui, form));
+            });
+        }
+        command
+    }
+
+    fn pending_download() -> RemoveForm {
+        RemoveForm::new(DownloadId(1), "clip.mp4".into(), false)
+    }
+
+    #[test]
+    fn enter_confirms_removing_a_pending_download() {
+        let mut form = pending_download();
+        let command = remove_dialog_after(&mut form, &[&[], &[egui::Key::Enter]]);
+        assert!(matches!(
+            command,
+            Some(DialogCommand::Remove {
+                files: RemoveFiles::Keep,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn enter_honours_the_delete_file_choice() {
+        let mut form = RemoveForm::new(DownloadId(1), "clip.mp4".into(), true);
+        form.delete_file = true;
+        let command = remove_dialog_after(&mut form, &[&[], &[egui::Key::Enter]]);
+        assert!(matches!(
+            command,
+            Some(DialogCommand::Remove {
+                files: RemoveFiles::Delete,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_remove_dialog_waits_without_a_key() {
+        let mut form = pending_download();
+        assert!(remove_dialog_after(&mut form, &[&[], &[]]).is_none());
+    }
+
+    #[test]
+    fn enter_on_a_tabbed_to_cancel_button_cancels() {
+        let mut form = pending_download();
+        let tab: &[egui::Key] = &[egui::Key::Tab];
+        let frames: [&[egui::Key]; 6] = [&[], tab, &[], tab, &[], &[egui::Key::Enter]];
+        let command = remove_dialog_after(&mut form, &frames);
+        assert!(matches!(command, Some(DialogCommand::Close)));
+    }
+
+    #[test]
+    fn enter_on_the_tabbed_to_checkbox_deletes_nothing() {
+        let mut form = RemoveForm::new(DownloadId(1), "clip.mp4".into(), true);
+        let tab: &[egui::Key] = &[egui::Key::Tab];
+        let frames: [&[egui::Key]; 4] = [&[], tab, &[], &[egui::Key::Enter]];
+        let command = remove_dialog_after(&mut form, &frames);
+        assert!(command.is_none());
     }
 }

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/downpour-build", "crates/downpour-core", "crates/downpour-protocol", "crates/downpour-host", "crates/downpour-app", "crates/downpour-cli", "crates/downpour-setup"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -18,7 +18,9 @@ directories = "6"
 fs4 = "0.13"
 futures-util = "0.3"
 getrandom = { version = "0.3", features = ["std"] }
+html-escape = "0.3"
 percent-encoding = "2"
+proptest = "1"
 roxmltree = "0.20"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
 serde = { version = "1", features = ["derive"] }

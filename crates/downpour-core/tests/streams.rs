@@ -369,3 +369,103 @@ async fn merges_fmp4_hls_with_separate_audio() {
     let file = download_stream(base.join("master.m3u8").unwrap(), &downloads, &data).await;
     assert_playable(&tools, &file);
 }
+
+/// A one-track HLS stream of `pieces` MPEG-TS pieces. Without ffmpeg it is
+/// saved as downloaded, so nothing decodes the bytes and they need not be
+/// real video.
+fn package_plain_hls(dir: &Path, pieces: usize, piece_bytes: usize) {
+    let mut playlist = String::from(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-PLAYLIST-TYPE:VOD\n",
+    );
+    for index in 0..pieces {
+        std::fs::write(
+            dir.join(format!("piece_{index}.ts")),
+            vec![0x47u8; piece_bytes],
+        )
+        .unwrap();
+        playlist.push_str(&format!("#EXTINF:1.0,\npiece_{index}.ts\n"));
+    }
+    playlist.push_str("#EXT-X-ENDLIST\n");
+    std::fs::write(dir.join("clip.m3u8"), playlist).unwrap();
+}
+
+/// The download's view once `done` holds for it.
+async fn view_once(
+    manager: &DownloadManager,
+    id: downpour_core::DownloadId,
+    done: impl Fn(&downpour_core::DownloadView) -> bool,
+) -> downpour_core::DownloadView {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let view = manager
+            .snapshot()
+            .into_iter()
+            .find(|view| view.id == id)
+            .unwrap();
+        if done(&view) {
+            return view;
+        }
+        if let DownloadStatus::Failed { reason } = &view.status {
+            panic!("stream download failed: {reason}");
+        }
+        assert!(Instant::now() < deadline, "timed out at {:?}", view.status);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_renamed_while_downloading_keeps_its_containers_extension() {
+    let (media, downloads, data) = workspace("rename-running");
+    package_plain_hls(&media, 8, 4096);
+    let base = serve_dir(media).await;
+    let settings = EngineSettings {
+        download_dir: downloads,
+        organize_by_category: false,
+        connections_per_download: 1,
+        // No ffmpeg: the pieces are joined as downloaded, into a `.ts` file.
+        ffmpeg_path: Some(data.join("no-ffmpeg.exe")),
+        ..Default::default()
+    };
+    let manager = DownloadManager::start(
+        Store::open(&data).unwrap(),
+        Vec::new(),
+        settings,
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let id = manager
+        .add(NewDownload {
+            url: base.join("clip.m3u8").unwrap(),
+            file_name: None,
+            folder: None,
+            context: RequestContext::default(),
+            start: StartMode::Hold,
+            kind: DownloadKind::Detect,
+            queue: None,
+            page_url: None,
+        })
+        .unwrap();
+    let slow = downpour_core::limiter::DownloadLimit::Limited {
+        kib_per_second: std::num::NonZeroU32::MIN,
+    };
+    manager.set_speed_limit(id, slow).unwrap();
+    manager.resume(id).unwrap();
+    view_once(&manager, id, |view| view.target.is_some()).await;
+
+    let renamed = manager.rename_file(id, "Rome at night").unwrap();
+
+    assert_eq!(
+        renamed,
+        downpour_core::Renamed::WhenFinished("Rome at night.ts".to_owned())
+    );
+    manager
+        .set_speed_limit(id, downpour_core::limiter::DownloadLimit::Unlimited)
+        .unwrap();
+    let done = view_once(&manager, id, |view| {
+        view.status == DownloadStatus::Completed
+    })
+    .await;
+    let saved = done.target.unwrap();
+    assert_eq!(saved.file_name().unwrap(), "Rome at night.ts");
+    assert_eq!(std::fs::metadata(&saved).unwrap().len(), 8 * 4096);
+}

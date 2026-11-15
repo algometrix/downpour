@@ -19,6 +19,21 @@ use eframe::egui;
 use super::{Action, Filter};
 
 const SETTLE: Duration = Duration::from_millis(700);
+/// Names the file frames are saved to; set, it turns the hook on.
+const OUTPUT_VAR: &str = "DOWNPOUR_SCREENSHOT";
+/// Where a review copy puts its window: beyond any monitor.
+const REVIEW_WINDOW_POSITION: [f32; 2] = [-20000.0, -20000.0];
+
+/// A review copy renders its own frames, so its window stays out of sight and
+/// never takes focus from whoever is using the computer.
+pub fn out_of_sight_when_reviewing(viewport: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    if std::env::var_os(OUTPUT_VAR).is_none() {
+        return viewport;
+    }
+    viewport
+        .with_active(false)
+        .with_position(REVIEW_WINDOW_POSITION)
+}
 
 pub enum HookCommand {
     Apply(Action),
@@ -77,7 +92,7 @@ pub struct ScreenshotHook {
 
 impl ScreenshotHook {
     pub fn from_env() -> Option<Self> {
-        let output = PathBuf::from(std::env::var_os("DOWNPOUR_SCREENSHOT")?);
+        let output = PathBuf::from(std::env::var_os(OUTPUT_VAR)?);
         let mut request = output.clone().into_os_string();
         request.push(".request");
         Some(Self {

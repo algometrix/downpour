@@ -6,13 +6,19 @@
 //! the most unclaimed bytes. A connection that finishes early therefore helps
 //! the slowest one instead of sitting idle, and no fixed split is ever wrong.
 //!
+//! Near the end no segment is big enough to halve, and a server can slow one
+//! connection to a trickle (a few KB/s: never slow enough for the read
+//! timeout). A connection measured that slow hands all but a second's worth
+//! of its range to a new connection, so the last piece cannot hold the
+//! download at 99% for minutes.
+//!
 //! A split is tentative until the server accepts the new connection: the
 //! running connection keeps its whole range meanwhile. Servers that refuse
 //! new requests late in a download (some download links do) would
 //! otherwise leave the second half with nobody able to fetch it, while the
 //! running connection could have finished it over the stream it has.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +72,58 @@ pub enum SplitConfirmation {
     NothingLeft,
 }
 
+/// How long a connection's speed is measured, from its first bytes, before
+/// it counts.
+const PACE_WINDOW: Duration = Duration::from_secs(2);
+/// A connection that would need longer than this for the rest of its range
+/// hands the range over.
+const SLOW_TAIL_PATIENCE: Duration = Duration::from_secs(5);
+/// What a slow connection keeps when it hands its range over: about this
+/// much of its own time, so the bytes it has in flight are not wasted.
+const SLOW_TAIL_KEEP: Duration = Duration::from_secs(1);
+/// The least a slow connection keeps, and the least it hands over.
+const SLOW_TAIL_MIN_PIECE: u64 = 16 * 1024;
+
+/// A connection's speed over its latest measuring window.
+#[derive(Clone, Copy, Debug)]
+struct Pace {
+    window_start: Instant,
+    claimed_at_start: u64,
+    /// Bytes per second over the last full window.
+    last_rate: Option<u64>,
+}
+
+impl Pace {
+    fn starting(now: Instant, claimed_to: u64) -> Self {
+        Self {
+            window_start: now,
+            claimed_at_start: claimed_to,
+            last_rate: None,
+        }
+    }
+
+    /// The speed over the current window once it is long enough to count,
+    /// so a connection that stopped receiving reads as slow; until then the
+    /// last full window's.
+    fn rate(&self, claimed_to: u64, now: Instant) -> Option<u64> {
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed < PACE_WINDOW {
+            return self.last_rate;
+        }
+        let bytes = claimed_to.saturating_sub(self.claimed_at_start);
+        Some((bytes as f64 / elapsed.as_secs_f64()) as u64)
+    }
+
+    fn record(&mut self, claimed_to: u64, now: Instant) {
+        if now.saturating_duration_since(self.window_start) >= PACE_WINDOW {
+            *self = Pace {
+                last_rate: self.rate(claimed_to, now),
+                ..Pace::starting(now, claimed_to)
+            };
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Slot {
     segment: Segment,
@@ -74,6 +132,8 @@ struct Slot {
     /// `write_position..claimed_to` are buffered in memory, not yet on disk.
     claimed_to: u64,
     assigned: bool,
+    /// The speed of the slot's connection, measured from its first bytes.
+    pace: Option<Pace>,
     consecutive_failures: u32,
     retry_not_before: Option<Instant>,
 }
@@ -85,6 +145,7 @@ impl Slot {
             segment,
             split: Split::Settled,
             assigned: false,
+            pace: None,
             consecutive_failures: 0,
             retry_not_before: None,
         }
@@ -194,8 +255,9 @@ impl SegmentTable {
     /// Chooses work for one new connection: an idle unfinished segment first,
     /// otherwise the second half of the assigned segment with the most
     /// unclaimed bytes, as a tentative split (see [`Self::confirm_split`]).
-    /// Returns `None` when splitting would create a segment smaller than
-    /// `min_split`.
+    /// When no segment can be halved without making one smaller than
+    /// `min_split`, a connection too slow to finish its range soon hands it
+    /// over (see the module notes). Returns `None` when there is no work.
     pub fn assign_next(&mut self, now: Instant, min_split: u64) -> Option<SlotId> {
         if let Some(index) = self.slots.iter().position(|slot| {
             slot.is_settled()
@@ -206,10 +268,14 @@ impl SegmentTable {
             self.slots[index].assigned = true;
             return Some(SlotId(index));
         }
+        self.halve_largest(min_split)
+            .or_else(|| self.hand_over_slow_tail(now))
+    }
 
-        // One tentative split per donor at a time: until it is accepted, the
-        // donor still owns the range and must not be split again.
-        let donors_waiting: Vec<usize> = self
+    /// Slots that a new connection may take part of: running, owning their
+    /// range, and with no split of theirs still waiting for the server.
+    fn donors(&self) -> impl Iterator<Item = (usize, &Slot)> {
+        let waiting: Vec<usize> = self
             .slots
             .iter()
             .filter_map(|slot| match slot.split {
@@ -217,30 +283,56 @@ impl SegmentTable {
                 Split::Settled | Split::Withdrawn => None,
             })
             .collect();
+        self.slots.iter().enumerate().filter(move |(index, slot)| {
+            slot.assigned && slot.is_settled() && !waiting.contains(index)
+        })
+    }
+
+    /// The second half of the segment with the most unclaimed bytes, unless
+    /// a half would be smaller than `min_split`.
+    fn halve_largest(&mut self, min_split: u64) -> Option<SlotId> {
         let (donor, unclaimed) = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(index, slot)| {
-                slot.assigned && slot.is_settled() && !donors_waiting.contains(index)
-            })
+            .donors()
             .map(|(index, slot)| (index, slot.unclaimed()))
             .max_by_key(|(_, unclaimed)| *unclaimed)?;
         if unclaimed < min_split.saturating_mul(2) {
             return None;
         }
+        let split_at = self.slots[donor].claimed_to + unclaimed / 2;
+        Some(self.split_off(donor, split_at))
+    }
 
-        let donor_slot = &self.slots[donor];
-        let split_at = donor_slot.claimed_to + unclaimed / 2;
+    /// All but about a second's worth of the range of the connection that
+    /// would take longest to finish, if that is longer than
+    /// `SLOW_TAIL_PATIENCE` at its measured speed.
+    fn hand_over_slow_tail(&mut self, now: Instant) -> Option<SlotId> {
+        let (donor, keep, _) = self
+            .donors()
+            .filter_map(|(index, slot)| {
+                let rate = slot.pace?.rate(slot.claimed_to, now)?;
+                let keep = slow_tail_keep(rate);
+                let unclaimed = slot.unclaimed();
+                let finishes_soon =
+                    (unclaimed as f64) <= rate as f64 * SLOW_TAIL_PATIENCE.as_secs_f64();
+                (!finishes_soon && unclaimed >= keep + SLOW_TAIL_MIN_PIECE)
+                    .then_some((index, keep, unclaimed))
+            })
+            .max_by_key(|(_, _, unclaimed)| *unclaimed)?;
+        let split_at = self.slots[donor].claimed_to + keep;
+        Some(self.split_off(donor, split_at))
+    }
+
+    /// A tentative new slot for `donor`'s range from `split_at` on.
+    fn split_off(&mut self, donor: usize, split_at: u64) -> SlotId {
         let mut tail = Slot::new(Segment {
             start: split_at,
-            end: donor_slot.segment.end,
+            end: self.slots[donor].segment.end,
             written: 0,
         });
         tail.split = Split::Tentative { donor };
         tail.assigned = true;
         self.slots.push(tail);
-        Some(SlotId(self.slots.len() - 1))
+        SlotId(self.slots.len() - 1)
     }
 
     /// The server accepted the new connection of a split: the donor gives up
@@ -272,11 +364,16 @@ impl SegmentTable {
     /// Accepts up to `available` incoming bytes for `slot`, never past the
     /// segment's current end (which may have shrunk after a split). Returns
     /// how many of the bytes the connection may keep.
-    pub fn claim(&mut self, slot: SlotId, available: u64) -> u64 {
+    pub fn claim(&mut self, slot: SlotId, available: u64, now: Instant) -> u64 {
         let slot = &mut self.slots[slot.0];
         let accepted = available.min(slot.unclaimed());
         slot.claimed_to += accepted;
         if accepted > 0 {
+            // Timed from the first bytes: connecting is not slow sending.
+            let claimed_before = slot.claimed_to - accepted;
+            slot.pace
+                .get_or_insert_with(|| Pace::starting(now, claimed_before))
+                .record(slot.claimed_to, now);
             slot.consecutive_failures = 0;
         }
         accepted
@@ -298,6 +395,7 @@ impl SegmentTable {
     pub fn release(&mut self, slot: SlotId) {
         let slot = &mut self.slots[slot.0];
         slot.assigned = false;
+        slot.pace = None;
         if let Split::Tentative { .. } = slot.split {
             // Never accepted: the range stays with the donor.
             slot.split = Split::Withdrawn;
@@ -321,6 +419,13 @@ impl SegmentTable {
     }
 }
 
+/// What a slow connection keeps of its range: about `SLOW_TAIL_KEEP` of its
+/// own time.
+fn slow_tail_keep(bytes_per_second: u64) -> u64 {
+    let in_keep_time = bytes_per_second as f64 * SLOW_TAIL_KEEP.as_secs_f64();
+    (in_keep_time as u64).max(SLOW_TAIL_MIN_PIECE)
+}
+
 /// 0.5 s, 1 s, 2 s, ... capped at 30 s.
 fn retry_backoff(consecutive_failures: u32) -> std::time::Duration {
     let millis = 500u64 << consecutive_failures.saturating_sub(1).min(6);
@@ -330,6 +435,97 @@ fn retry_backoff(consecutive_failures: u32) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KIB: u64 = 1024;
+
+    /// A two-connection download near its end: the first connection holds
+    /// the last 600 KiB, too little to halve with a 1 MiB minimum.
+    fn tail_on_one_connection(start: Instant) -> (SegmentTable, SlotId) {
+        let size = 10 * MIB;
+        let mut table = SegmentTable::from_saved(
+            size,
+            vec![
+                Segment {
+                    start: 0,
+                    end: size - 600 * KIB,
+                    written: size - 600 * KIB,
+                },
+                Segment {
+                    start: size - 600 * KIB,
+                    end: size,
+                    written: 0,
+                },
+            ],
+        )
+        .unwrap();
+        let slow = table.assign_next(start, MIB).unwrap();
+        (table, slow)
+    }
+
+    #[test]
+    fn a_trickling_last_piece_is_handed_to_a_new_connection() {
+        let start = Instant::now();
+        let (mut table, slow) = tail_on_one_connection(start);
+        // About 6 KB/s, as a server that throttles one connection sends.
+        table.claim(slow, 2 * KIB, start);
+        let measured = start + Duration::from_secs(3);
+        table.claim(slow, 16 * KIB, measured);
+
+        let helper = table
+            .assign_next(measured, MIB)
+            .expect("the slow tail is handed over");
+
+        let kept_to = table.segment(slow).start + 18 * KIB + SLOW_TAIL_MIN_PIECE;
+        assert_eq!(table.segment(helper).start, kept_to);
+        assert_eq!(
+            table.confirm_split(helper),
+            SplitConfirmation::Proceed { skip: 0 }
+        );
+        assert_eq!(table.segment(slow).end, kept_to);
+    }
+
+    #[test]
+    fn a_connection_that_stops_receiving_hands_over_its_range() {
+        let start = Instant::now();
+        let (mut table, slow) = tail_on_one_connection(start);
+        table.claim(slow, 2 * KIB, start);
+        assert!(table
+            .assign_next(start + Duration::from_secs(3), MIB)
+            .is_some());
+    }
+
+    #[test]
+    fn a_fast_last_piece_keeps_its_connection() {
+        let start = Instant::now();
+        let (mut table, slow) = tail_on_one_connection(start);
+        table.claim(slow, KIB, start);
+        let measured = start + Duration::from_secs(2);
+        // 200 KiB/s finishes the rest well within the patience.
+        table.claim(slow, 400 * KIB, measured);
+        assert_eq!(table.assign_next(measured, MIB), None);
+    }
+
+    #[test]
+    fn a_new_connection_is_not_judged_before_it_is_measured() {
+        let start = Instant::now();
+        let (mut table, slow) = tail_on_one_connection(start);
+        table.claim(slow, KIB, start);
+        assert_eq!(table.assign_next(start + Duration::from_secs(1), MIB), None);
+    }
+
+    #[test]
+    fn time_spent_connecting_does_not_count_as_slow() {
+        let start = Instant::now();
+        let (mut table, slow) = tail_on_one_connection(start);
+        // The first bytes arrive 1.5 s after the request: a slow handshake.
+        let first_bytes = start + Duration::from_millis(1500);
+        table.claim(slow, 50 * KIB, first_bytes);
+        // Half a second of receiving is too short to judge, however long
+        // the connection took to start.
+        let soon_after = first_bytes + Duration::from_millis(500);
+        table.claim(slow, 50 * KIB, soon_after);
+        assert_eq!(table.assign_next(soon_after, MIB), None);
+    }
 
     const MIB: u64 = 1024 * 1024;
 
@@ -362,7 +558,7 @@ mod tests {
         assert_eq!(table.release_after_failure(second, Instant::now()), 0);
         assert_eq!(table.segment(first).end, 100 * MIB);
         // The running connection can still claim every byte.
-        assert_eq!(table.claim(first, 100 * MIB), 100 * MIB);
+        assert_eq!(table.claim(first, 100 * MIB, Instant::now()), 100 * MIB);
         table.record_written(first, 100 * MIB);
         assert!(table.is_complete());
         // The withdrawn half is never handed out again.
@@ -372,7 +568,7 @@ mod tests {
     #[test]
     fn bytes_the_donor_claimed_meanwhile_are_skipped() {
         let (mut table, first, second) = split_two(100 * MIB);
-        table.claim(first, 60 * MIB);
+        table.claim(first, 60 * MIB, Instant::now());
         assert_eq!(
             table.confirm_split(second),
             SplitConfirmation::Proceed { skip: 10 * MIB }
@@ -384,7 +580,7 @@ mod tests {
     #[test]
     fn a_split_the_donor_finished_has_nothing_left() {
         let (mut table, first, second) = split_two(100 * MIB);
-        table.claim(first, 100 * MIB);
+        table.claim(first, 100 * MIB, Instant::now());
         assert_eq!(table.confirm_split(second), SplitConfirmation::NothingLeft);
         assert_eq!(table.segment(first).end, 100 * MIB);
     }
@@ -408,7 +604,7 @@ mod tests {
         let now = Instant::now();
         let mut table = SegmentTable::whole_file(100 * MIB);
         let first = table.assign_next(now, MIB).unwrap();
-        table.claim(first, 20 * MIB);
+        table.claim(first, 20 * MIB, Instant::now());
 
         let second = table.assign_next(now, MIB).unwrap();
         table.confirm_split(second);
@@ -440,7 +636,7 @@ mod tests {
         let second = table.assign_next(now, MIB).unwrap();
         table.confirm_split(second);
 
-        assert_eq!(table.claim(first, 8 * MIB), 5 * MIB);
+        assert_eq!(table.claim(first, 8 * MIB, Instant::now()), 5 * MIB);
         assert!(table.is_fully_claimed(first));
     }
 
@@ -457,7 +653,7 @@ mod tests {
         let now = Instant::now();
         let mut table = SegmentTable::whole_file(10 * MIB);
         let first = table.assign_next(now, MIB).unwrap();
-        table.claim(first, MIB);
+        table.claim(first, MIB, Instant::now());
         table.record_written(first, MIB);
         table.release(first);
 
@@ -491,12 +687,12 @@ mod tests {
         let now = Instant::now();
         let mut table = SegmentTable::whole_file(10 * MIB);
         let first = table.assign_next(now, MIB).unwrap();
-        table.claim(first, 4 * MIB);
+        table.claim(first, 4 * MIB, Instant::now());
         table.record_written(first, MIB);
         table.release(first);
 
         let again = table.assign_next(now, MIB).unwrap();
-        assert_eq!(table.claim(again, 100 * MIB), 9 * MIB);
+        assert_eq!(table.claim(again, 100 * MIB, Instant::now()), 9 * MIB);
     }
 
     #[test]

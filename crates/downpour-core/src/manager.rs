@@ -23,12 +23,11 @@ use crate::history::CompletedDownload;
 use crate::http::{url_for_logs, RequestContext, Validators};
 use crate::limiter::{DownloadLimit, RateLimiter, Throttle};
 use crate::link_check::{self, CheckedLink};
-use crate::naming::{FileName, FileNameSource};
+use crate::naming::{first_free_path, FileName};
 use crate::ordering::{self, QueuePlace};
 use crate::queue::{Queue, QueueError, QueueId, QueueState, Queues};
 use crate::record::{
-    part_path, track_path, Destination, DownloadId, DownloadRecord, DownloadSource,
-    TransferProgress, MAX_STREAM_TRACKS,
+    unfinished_files, Destination, DownloadId, DownloadRecord, DownloadSource, TransferProgress,
 };
 use crate::segment::Segment;
 use crate::settings::EngineSettings;
@@ -36,7 +35,7 @@ use crate::status::{DownloadStatus, InvalidTransition, StatusEvent};
 use crate::store::{Store, StoreError};
 use crate::stream::{self, mux, StreamError, StreamFormat, StreamOffer, VariantInfo, VideoQuality};
 use crate::transfer::{
-    run_transfer, TransferEvent, TransferJob, TransferOutcome, TransferServices,
+    run_transfer, FinalName, TransferEvent, TransferJob, TransferOutcome, TransferServices,
 };
 
 const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
@@ -107,6 +106,45 @@ pub enum ManagerError {
     NotWaiting(DownloadId),
 }
 
+/// Why a finished download's file could not be renamed. Each message says
+/// what the user can do about it.
+#[derive(Debug, thiserror::Error)]
+pub enum RenameError {
+    #[error("download {0} does not exist")]
+    UnknownDownload(DownloadId),
+    #[error("\"{0}\" cannot name a file")]
+    UnusableName(String),
+    #[error("type only a name; the file stays in its folder")]
+    NameHasFolder,
+    #[error("the file is no longer at {}; it was moved or deleted", .0.display())]
+    FileMissing(PathBuf),
+    #[error("{} already exists; choose another name", .0.display())]
+    NameTaken(PathBuf),
+    #[error("could not rename {}: {source}", .path.display())]
+    Disk {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("the download was removed while its file was being renamed; the file was put back")]
+    ChangedMeanwhile,
+    #[error(
+        "the download was removed while its file was being renamed; the file is now at {}",
+        .0.display()
+    )]
+    LeftAt(PathBuf),
+    #[error("the download finished just now; rename the finished file again")]
+    JustFinished,
+}
+
+/// When a renamed file has its new name.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Renamed {
+    /// The finished file was renamed; this is its new path.
+    Now(PathBuf),
+    /// The download is unfinished; its file takes this name once complete.
+    WhenFinished(String),
+}
+
 /// Read-only snapshot of one download for display.
 #[derive(Clone, Debug)]
 pub struct DownloadView {
@@ -153,6 +191,11 @@ pub struct StreamView {
 }
 
 impl DownloadView {
+    /// Where the file is, once the download finished.
+    pub fn finished_file(&self) -> Option<&std::path::Path> {
+        crate::record::finished_file(&self.status, self.target.as_deref())
+    }
+
     pub fn fraction(&self) -> Option<f32> {
         if self.status == DownloadStatus::Completed {
             return Some(1.0);
@@ -183,6 +226,10 @@ struct Inner {
     events: mpsc::UnboundedSender<(DownloadId, TransferEvent)>,
     dirty: AtomicBool,
     persist_now: Notify,
+    /// Held while one save takes its snapshot and writes it, so an older
+    /// snapshot can never land after a newer one: the final save at exit
+    /// would otherwise lose downloads added since a background save began.
+    save_turn: Mutex<()>,
     listener: Mutex<Option<ChangeListener>>,
 }
 
@@ -248,6 +295,8 @@ struct Aftermath {
 
 struct Live {
     cancel: CancellationToken,
+    /// The finished file's name, which the user can change while it runs.
+    final_name: FinalName,
     throttle: Arc<Throttle>,
     bytes_per_second: u64,
     connections: usize,
@@ -287,6 +336,19 @@ impl DownloadManager {
             seed_history(&store, &records, &settings.categories);
         }
         let mut records = records;
+        let renamed = records.iter_mut().fold(false, |renamed, record| {
+            clean_unfinished_name(record) || renamed
+        });
+        // The part files have moved, so a crash must not bring back the old
+        // paths: a failed save is retried by the persister.
+        let unsaved = renamed
+            && match store.save_downloads(&records) {
+                Ok(()) => false,
+                Err(error) => {
+                    tracing::error!(%error, "saving cleaned download names failed; retrying");
+                    true
+                }
+            };
         records.sort_by_key(|record| (record.position, record.id));
         let downloads = records
             .into_iter()
@@ -319,8 +381,9 @@ impl DownloadManager {
                 store,
                 runtime: runtime.clone(),
                 events,
-                dirty: AtomicBool::new(false),
+                dirty: AtomicBool::new(unsaved),
                 persist_now: Notify::new(),
+                save_turn: Mutex::new(()),
                 listener: Mutex::new(None),
             }),
         };
@@ -394,6 +457,7 @@ impl DownloadManager {
                 // New downloads go to the end of the line.
                 position: state.last_position() + 1,
                 speed_limit: DownloadLimit::FollowSettings,
+                name_when_finished: None,
             };
             tracing::info!(download = %id, url = %url_for_logs(&record.url), "download added");
             state.downloads.insert(
@@ -527,6 +591,163 @@ impl DownloadManager {
         }
         self.changed_and_persist();
         Ok(())
+    }
+
+    /// Renames a download's file in the folder it is saved to. A finished
+    /// file is renamed now; an unfinished one is saved under the name when
+    /// it finishes.
+    pub fn rename_file(&self, id: DownloadId, typed: &str) -> Result<Renamed, RenameError> {
+        if typed.contains(['/', '\\']) {
+            return Err(RenameError::NameHasFolder);
+        }
+        let name = FileName::from_typed(typed.trim())
+            .ok_or_else(|| RenameError::UnusableName(typed.to_owned()))?;
+        match self.saved_file(id)? {
+            SavedFile::Finished(current) => {
+                self.rename_finished(id, &current, &name).map(Renamed::Now)
+            }
+            SavedFile::Reserved(reserved) => self.rename_reserved(id, &reserved, name),
+            SavedFile::ReservedStream(reserved) => {
+                let name = stream::download::named_like_reserved(&name, &reserved);
+                self.rename_reserved(id, &reserved, name)
+            }
+            SavedFile::NotReserved => self.rename_unfinished(id, name),
+        }
+    }
+
+    fn rename_finished(
+        &self,
+        id: DownloadId,
+        current: &std::path::Path,
+        name: &FileName,
+    ) -> Result<PathBuf, RenameError> {
+        let renamed = folder_of(current).join(&name.value);
+        if renamed == current {
+            return Ok(renamed);
+        }
+        if !current.is_file() {
+            return Err(RenameError::FileMissing(current.to_path_buf()));
+        }
+        if disk::is_name_taken(&renamed, Some(current)) {
+            return Err(RenameError::NameTaken(renamed));
+        }
+        self.move_finished_file(id, current, &renamed, name)?;
+        Ok(renamed)
+    }
+
+    /// Saves a download whose file is reserved as `name` when it finishes.
+    fn rename_reserved(
+        &self,
+        id: DownloadId,
+        reserved: &std::path::Path,
+        name: FileName,
+    ) -> Result<Renamed, RenameError> {
+        // Checked now, so a clash shows while the user can pick again.
+        let renamed = folder_of(reserved).join(&name.value);
+        if disk::is_name_taken(&renamed, Some(reserved)) {
+            return Err(RenameError::NameTaken(renamed));
+        }
+        self.rename_unfinished(id, name)
+    }
+
+    /// Saves an unfinished download's file as `name` when it finishes. One
+    /// that has not reserved its file yet just takes the name, so it is also
+    /// saved in that name's category folder.
+    fn rename_unfinished(&self, id: DownloadId, name: FileName) -> Result<Renamed, RenameError> {
+        {
+            let mut state = self.state();
+            let entry = state
+                .downloads
+                .get_mut(&id)
+                .ok_or(RenameError::UnknownDownload(id))?;
+            if entry.record.finished_file().is_some() {
+                return Err(RenameError::JustFinished);
+            }
+            match (&entry.live, &entry.record.target) {
+                (Some(live), _) => {
+                    if !live.final_name.choose(name.clone()) {
+                        return Err(RenameError::JustFinished);
+                    }
+                    entry.record.name_when_finished = Some(name.clone());
+                }
+                (None, Some(_)) => entry.record.name_when_finished = Some(name.clone()),
+                (None, None) => {
+                    entry.record.file_name = name.clone();
+                    entry.record.name_when_finished = None;
+                }
+            }
+        }
+        tracing::info!(download = %id, "the file gets its new name when the download finishes");
+        self.changed_and_persist();
+        Ok(Renamed::WhenFinished(name.value))
+    }
+
+    /// Moves a finished file to `renamed` without replacing anything there,
+    /// then records the new name.
+    fn move_finished_file(
+        &self,
+        id: DownloadId,
+        current: &std::path::Path,
+        renamed: &std::path::Path,
+        name: &FileName,
+    ) -> Result<(), RenameError> {
+        // On a disk that ignores case, "clip.mp4" is "Clip.mp4": changing only
+        // the case renames the file itself, so nothing else can be replaced.
+        let moved = if disk::is_same_file(renamed, current) {
+            std::fs::rename(current, renamed)
+        } else {
+            disk::rename_without_replacing(current, renamed)
+        };
+        moved.map_err(|source| match source.kind() {
+            std::io::ErrorKind::AlreadyExists => RenameError::NameTaken(renamed.to_path_buf()),
+            _ => RenameError::Disk {
+                path: current.to_path_buf(),
+                source,
+            },
+        })?;
+        // The file was renamed outside the lock (no file operation runs under
+        // it), so the download must still pass the check that allowed it.
+        let recorded = {
+            let mut state = self.state();
+            match state.downloads.get_mut(&id) {
+                Some(entry) if entry.record.finished_file() == Some(current) => {
+                    entry.record.file_name = name.saved_as(renamed);
+                    entry.record.target = Some(renamed.to_path_buf());
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !recorded {
+            return Err(match disk::rename_without_replacing(renamed, current) {
+                Ok(()) => RenameError::ChangedMeanwhile,
+                Err(error) => {
+                    tracing::error!(%error, path = %renamed.display(), "putting a renamed file back failed");
+                    RenameError::LeftAt(renamed.to_path_buf())
+                }
+            });
+        }
+        tracing::info!(download = %id, "renamed a finished file");
+        self.changed_and_persist();
+        Ok(())
+    }
+
+    /// Where a download's file is, or is reserved, so far.
+    fn saved_file(&self, id: DownloadId) -> Result<SavedFile, RenameError> {
+        let state = self.state();
+        let record = &state
+            .downloads
+            .get(&id)
+            .ok_or(RenameError::UnknownDownload(id))?
+            .record;
+        Ok(match (record.finished_file(), &record.target) {
+            (Some(file), _) => SavedFile::Finished(file.to_path_buf()),
+            (None, Some(reserved)) => match record.source {
+                DownloadSource::Stream { .. } => SavedFile::ReservedStream(reserved.clone()),
+                DownloadSource::File => SavedFile::Reserved(reserved.clone()),
+            },
+            (None, None) => SavedFile::NotReserved,
+        })
     }
 
     pub fn pause_all(&self) {
@@ -799,7 +1020,7 @@ impl DownloadManager {
         {
             std::thread::sleep(Duration::from_millis(50));
         }
-        if let Err(error) = self.inner.store.save_downloads(&self.records()) {
+        if let Err(error) = self.save_records() {
             tracing::error!(%error, "final save failed");
         }
     }
@@ -861,6 +1082,14 @@ impl DownloadManager {
     /// Starts the transfer of a queued download.
     fn launch(&self, entry: &mut Entry, settings: &EngineSettings) {
         transition(&mut entry.record, StatusEvent::Started);
+        // A name chosen while an earlier run was still connecting waits in
+        // `name_when_finished`. With no file reserved yet it simply becomes
+        // the name, so the file is reserved, and filed by category, under it.
+        if entry.record.target.is_none() {
+            if let Some(name) = entry.record.name_when_finished.take() {
+                entry.record.file_name = name;
+            }
+        }
         let record = &entry.record;
         let job = TransferJob {
             id: record.id,
@@ -874,6 +1103,7 @@ impl DownloadManager {
             max_connections: usize::from(settings.connections_per_download),
             source: record.source.clone(),
             categories: settings.categories.clone(),
+            final_name: FinalName::new(record.name_when_finished.clone()),
             ffmpeg: match record.source {
                 DownloadSource::File => None,
                 DownloadSource::Stream { .. } => {
@@ -891,6 +1121,7 @@ impl DownloadManager {
             throttle: Arc::clone(&throttle),
             store: self.inner.store.clone(),
         };
+        let final_name = job.final_name.clone();
         tracing::info!(download = %job.id, "transfer starting");
         self.inner.runtime.spawn(run_transfer(
             job,
@@ -899,6 +1130,7 @@ impl DownloadManager {
             self.inner.events.clone(),
         ));
         entry.live = Some(Live {
+            final_name,
             cancel,
             throttle,
             bytes_per_second: 0,
@@ -979,6 +1211,13 @@ impl DownloadManager {
                 let after_stop = std::mem::replace(&mut entry.after_stop, AfterStop::Pause);
                 match outcome {
                     TransferOutcome::Completed { path } => {
+                        // The transfer saved the file under the name chosen
+                        // while it ran (see `FinalName`), perhaps numbered.
+                        let name = record
+                            .name_when_finished
+                            .take()
+                            .unwrap_or_else(|| record.file_name.clone());
+                        record.file_name = name.saved_as(&path);
                         record.target = Some(path);
                         record.finished_at_unix = Some(unix_now());
                         transition(record, StatusEvent::Completed);
@@ -1078,9 +1317,8 @@ impl DownloadManager {
             if !self.inner.dirty.swap(false, Ordering::Relaxed) {
                 continue;
             }
-            let records = self.records();
-            let store = self.inner.store.clone();
-            let saved = tokio::task::spawn_blocking(move || store.save_downloads(&records)).await;
+            let manager = self.clone();
+            let saved = tokio::task::spawn_blocking(move || manager.save_records()).await;
             match saved {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -1090,6 +1328,17 @@ impl DownloadManager {
                 Err(error) => tracing::error!(%error, "save task panicked"),
             }
         }
+    }
+
+    /// Writes the download list as it is now. Saves take turns (see
+    /// `save_turn`); the state lock is held only to copy the list.
+    fn save_records(&self) -> Result<(), StoreError> {
+        let _turn = self
+            .inner
+            .save_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.inner.store.save_downloads(&self.records())
     }
 
     fn changed_and_persist(&self) {
@@ -1140,11 +1389,71 @@ fn leftovers(record: &DownloadRecord, files: RemoveFiles, store: &Store) -> Left
     Leftovers(paths)
 }
 
-/// The part file and any stream track files that belong to `target`.
-fn unfinished_files(target: &std::path::Path) -> Vec<PathBuf> {
-    std::iter::once(part_path(target))
-        .chain((0..MAX_STREAM_TRACKS).map(|index| track_path(target, index)))
-        .collect()
+/// Cleans the name of an unfinished download saved with web escapes, so it does
+/// not finish as `My%20Clip.mp4`. Finished files stay as they are: the user may
+/// already have them open or organized. Returns whether the record changed.
+fn clean_unfinished_name(record: &mut DownloadRecord) -> bool {
+    if record.status == DownloadStatus::Completed {
+        return false;
+    }
+    let Some(cleaned) = record.file_name.cleaned_of_web_escapes() else {
+        return false;
+    };
+    let Some(target) = &record.target else {
+        record.file_name = cleaned;
+        return true;
+    };
+    match move_unfinished_files(target, &cleaned.value) {
+        Ok(moved_to) => {
+            record.file_name = cleaned.saved_as(&moved_to);
+            record.target = Some(moved_to);
+            true
+        }
+        Err(error) => {
+            tracing::warn!(download = %record.id, %error, "keeping the escaped file name");
+            false
+        }
+    }
+}
+
+/// Moves a download's part and track files to the first free path for `name`,
+/// beside where they are. If one cannot move, those already moved go back.
+fn move_unfinished_files(target: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
+    let directory = target.parent().unwrap_or(std::path::Path::new(""));
+    let moved_to = first_free_path(directory, name, |path| {
+        disk::is_name_taken(path, Some(target))
+    });
+    let moves = unfinished_files(target)
+        .into_iter()
+        .zip(unfinished_files(&moved_to))
+        .filter(|(from, _)| from.exists())
+        .collect::<Vec<_>>();
+    for (index, (from, to)) in moves.iter().enumerate() {
+        if let Err(error) = std::fs::rename(from, to) {
+            for (back, moved) in &moves[..index] {
+                if let Err(undo) = std::fs::rename(moved, back) {
+                    tracing::error!(error = %undo, path = %moved.display(), "moving a part file back failed");
+                }
+            }
+            return Err(error);
+        }
+    }
+    Ok(moved_to)
+}
+
+/// A download's file as rename sees it.
+enum SavedFile {
+    Finished(PathBuf),
+    /// The transfer writes under this name until the download finishes.
+    Reserved(PathBuf),
+    /// As `Reserved`, for a stream: its container chose the extension.
+    ReservedStream(PathBuf),
+    /// No transfer has chosen its file's name yet.
+    NotReserved,
+}
+
+fn folder_of(path: &std::path::Path) -> &std::path::Path {
+    path.parent().unwrap_or(std::path::Path::new(""))
 }
 
 fn forget_stream_plan(store: &Store, id: DownloadId) {
@@ -1231,14 +1540,14 @@ impl Entry {
         };
         DownloadView {
             id: record.id,
-            file_name: record.file_name.value.clone(),
+            file_name: record.shown_name().value.clone(),
             url: record.url.clone(),
             page_url: record.page_url.clone(),
             referrer: record.context.referrer.clone(),
             queue: record.queue,
             directory: record.directory(categories),
             target: record.target.clone(),
-            category: categories.classify(&record.file_name.value),
+            category: categories.classify(&record.shown_name().value),
             status: record.status.clone(),
             size: record.progress.total_size(),
             received: record.progress.received_bytes(),
@@ -1270,10 +1579,7 @@ impl NewDownload {
         start: StartMode,
     ) -> Self {
         Self {
-            file_name: file_name
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(|name| FileName::new(name, FileNameSource::User)),
+            file_name: file_name.and_then(FileName::from_typed),
             url,
             folder,
             context: RequestContext::default(),

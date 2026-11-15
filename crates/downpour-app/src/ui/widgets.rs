@@ -20,6 +20,18 @@ use super::theme::{
 
 const BUTTON_HEIGHT: f32 = 36.0;
 pub const NAV_ITEM_HEIGHT: f32 = 38.0;
+/// How far sidebar content sits inside its row or card, on both sides: icons,
+/// section titles and card text start this far in, and counts, switches and
+/// small buttons end this far in, so each side reads as one straight edge.
+pub const SIDEBAR_INSET: f32 = 12.0;
+/// Size of a navigation entry's icon.
+const NAV_ICON_SIZE: f32 = 17.0;
+/// Space between a navigation entry's icon and its label.
+const NAV_ICON_GAP: f32 = 13.0;
+/// Where a navigation entry's label starts, from the row's left edge.
+const NAV_LABEL_LEFT: f32 = SIDEBAR_INSET + NAV_ICON_SIZE + NAV_ICON_GAP;
+/// Space between a navigation entry's label and its count.
+const NAV_COUNT_GAP: f32 = 8.0;
 const BUTTON_PADDING_X: f32 = 16.0;
 const BUTTON_ICON: f32 = 16.0;
 const BUTTON_GAP: f32 = 8.0;
@@ -189,6 +201,9 @@ pub fn icon_button_at(
         .on_hover_cursor(CursorIcon::PointingHand)
 }
 
+/// Space between an icon button's edge and its icon.
+pub const ICON_BUTTON_MARGIN: f32 = 8.0;
+
 fn paint_icon_button(
     painter: &Painter,
     rect: Rect,
@@ -209,7 +224,7 @@ fn paint_icon_button(
         }
     }
     let color = if hovered { ink.hover_icon } else { ink.icon };
-    icon.paint(painter, rect.shrink(8.0), color);
+    icon.paint(painter, rect.shrink(ICON_BUTTON_MARGIN), color);
 }
 
 /// Width a pill needs for `text`.
@@ -595,15 +610,21 @@ pub fn nav_item(ui: &mut Ui, ink: &NavInk, entry: NavEntry<'_>) -> Response {
                 }
             }
         };
-        let icon_rect =
-            Rect::from_center_size(pos2(rect.left() + 22.0, rect.center().y), vec2(17.0, 17.0));
+        let icon_rect = Rect::from_min_size(
+            pos2(
+                rect.left() + SIDEBAR_INSET,
+                rect.center().y - NAV_ICON_SIZE / 2.0,
+            ),
+            vec2(NAV_ICON_SIZE, NAV_ICON_SIZE),
+        );
         icon.paint(painter, icon_rect, look.icon);
 
         let count_text = count.map(|count| count.to_string());
         let badge_width = count_text
             .as_deref()
             .map_or(0.0, |text| pill_width(ui, text));
-        let label_width = rect.width() - 44.0 - badge_width - 12.0;
+        let label_width =
+            rect.width() - NAV_LABEL_LEFT - badge_width - NAV_COUNT_GAP - SIDEBAR_INSET;
         let font = if selected {
             theme::semibold(14.0)
         } else {
@@ -611,7 +632,10 @@ pub fn nav_item(ui: &mut Ui, ink: &NavInk, entry: NavEntry<'_>) -> Response {
         };
         let text = elided(ui, label, font, look.text, label_width);
         let text_rect = Rect::from_min_size(
-            pos2(rect.left() + 42.0, rect.center().y - text.size().y / 2.0),
+            pos2(
+                rect.left() + NAV_LABEL_LEFT,
+                rect.center().y - text.size().y / 2.0,
+            ),
             text.size(),
         );
         painter.galley(text_rect.min, text, look.text);
@@ -627,7 +651,7 @@ pub fn nav_item(ui: &mut Ui, ink: &NavInk, entry: NavEntry<'_>) -> Response {
             let (fg, bg) = look.badge;
             pill(
                 ui,
-                pos2(rect.right() - badge_width - 8.0, rect.center().y),
+                pos2(rect.right() - badge_width - SIDEBAR_INSET, rect.center().y),
                 &count_text,
                 fg,
                 bg,
@@ -640,13 +664,32 @@ pub fn nav_item(ui: &mut Ui, ink: &NavInk, entry: NavEntry<'_>) -> Response {
 /// A sidebar section's heading, in the sidebar's faint ink.
 pub fn section_label(ui: &mut Ui, text: &str) {
     ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(text.to_uppercase())
-            .font(theme::semibold(11.5))
-            .color(theme::sidebar_ink().ink_faint),
-    );
+    ui.horizontal(|ui| {
+        ui.add_space(SIDEBAR_INSET);
+        ui.label(
+            egui::RichText::new(text.to_uppercase())
+                .font(theme::semibold(11.5))
+                .color(theme::sidebar_ink().ink_faint),
+        );
+    });
     ui.add_space(2.0);
 }
+
+/// The square hover box, `size` wide, of a small icon button at the end of a
+/// sidebar `row`. The icon, not its box, ends at `SIDEBAR_INSET`, in line with
+/// the counts; `icon_margin` is the space the box leaves around the icon.
+pub fn trailing_icon_box(row: Rect, size: f32, icon_margin: f32) -> Rect {
+    Rect::from_min_size(
+        pos2(
+            row.right() - SIDEBAR_INSET + icon_margin - size,
+            row.center().y - size / 2.0,
+        ),
+        vec2(size, size),
+    )
+}
+
+/// Space between a section button's hover box and its icon.
+const SECTION_ICON_MARGIN: f32 = 5.0;
 
 /// Sidebar section heading with a small icon button at its right edge.
 pub fn section_label_with_action(ui: &mut Ui, text: &str, icon: Icon, tooltip: &str) -> Response {
@@ -661,14 +704,14 @@ pub fn section_label_with_action(ui: &mut Ui, text: &str, icon: Icon, tooltip: &
         ink.ink_faint,
     );
     ui.painter().galley(
-        pos2(rect.left(), rect.center().y - label.size().y / 2.0),
+        pos2(
+            rect.left() + SIDEBAR_INSET,
+            rect.center().y - label.size().y / 2.0,
+        ),
         label,
         ink.ink_faint,
     );
-    let button = Rect::from_min_size(
-        pos2(rect.right() - height, rect.top()),
-        vec2(height, height),
-    );
+    let button = trailing_icon_box(rect, height, SECTION_ICON_MARGIN);
     let id = ui.id().with(("section-action", text));
     let response = ui.interact(button, id, Sense::click());
     if response.hovered() {
@@ -683,7 +726,7 @@ pub fn section_label_with_action(ui: &mut Ui, text: &str, icon: Icon, tooltip: &
     } else {
         ink.ink_faint
     };
-    icon.paint(ui.painter(), button.shrink(5.0), color);
+    icon.paint(ui.painter(), button.shrink(SECTION_ICON_MARGIN), color);
     ui.add_space(2.0);
     response
         .on_hover_text(tooltip)

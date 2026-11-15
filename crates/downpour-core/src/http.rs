@@ -275,6 +275,17 @@ fn header_text(response: &Response, name: header::HeaderName) -> Option<String> 
         .map(str::to_owned)
 }
 
+/// The `Content-Disposition` header as text. Many servers send a file name's
+/// raw bytes, which `HeaderValue::to_str` refuses: they are UTF-8 in practice,
+/// and Latin-1 is what HTTP defined for bytes that are not.
+pub(crate) fn content_disposition_text(headers: &header::HeaderMap) -> Option<String> {
+    let bytes = headers.get(header::CONTENT_DISPOSITION)?.as_bytes();
+    Some(match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => bytes.iter().copied().map(char::from).collect(),
+    })
+}
+
 /// Opens the resource with `Range: bytes=0-` so one round trip reveals the
 /// size, range support, file name, and validators.
 pub async fn probe(
@@ -312,7 +323,7 @@ pub async fn probe(
 
     Ok(Probe {
         final_url: response.url().clone(),
-        server_file_name: header_text(&response, header::CONTENT_DISPOSITION)
+        server_file_name: content_disposition_text(response.headers())
             .as_deref()
             .and_then(file_name_from_content_disposition),
         validators: Validators {
@@ -365,6 +376,23 @@ pub async fn fetch_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_disposition_keeps_raw_name_bytes() {
+        let header_with = |bytes: &[u8]| {
+            let mut headers = header::HeaderMap::new();
+            headers.insert(
+                header::CONTENT_DISPOSITION,
+                header::HeaderValue::from_bytes(bytes).unwrap(),
+            );
+            content_disposition_text(&headers)
+        };
+        let utf8 = header_with(b"filename=\"na\xC3\xAFve.mp4\"");
+        assert_eq!(utf8.as_deref(), Some("filename=\"na\u{ef}ve.mp4\""));
+        let latin1 = header_with(b"filename=\"na\xEFve.mp4\"");
+        assert_eq!(latin1.as_deref(), Some("filename=\"na\u{ef}ve.mp4\""));
+        assert_eq!(content_disposition_text(&header::HeaderMap::new()), None);
+    }
 
     fn with_cookie() -> ScopedContext {
         RequestContext {

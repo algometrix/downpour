@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::num::NonZeroU32;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,7 @@ use super::widgets::{
     progress_bar, solid_tile_colors, stat_tile_row, ButtonKind, StatTile, TileColors,
 };
 use super::{download_page, format, hotkeys, queue_state_label, theme, Action, Catalog, Filter};
+use crate::app_settings::{ListOrder, SortColumn, SortDirection};
 
 const ROW_HEIGHT: f32 = 64.0;
 const COLUMN_GAP: f32 = 16.0;
@@ -29,6 +31,11 @@ const PROGRESS_WIDTH: f32 = 180.0;
 const MIN_NAME_WIDTH: f32 = 150.0;
 const SEARCH_MIN_WIDTH: f32 = 180.0;
 const SEARCH_MAX_WIDTH: f32 = 380.0;
+/// The search field's width with labeled bulk buttons beside it: room for its
+/// whole hint, "Search downloads… (Ctrl+F)". Narrower, the buttons give way.
+const SEARCH_LABELED_MIN_WIDTH: f32 = 260.0;
+/// Space kept between the search side of the toolbar and its buttons.
+const TOOLBAR_GAP: f32 = 24.0;
 /// Room between the list card's edge and its rows.
 const LIST_CARD_MARGIN: egui::Margin = egui::Margin::symmetric(12, 14);
 /// Space between two row cards; half of it sits above a card and half
@@ -48,13 +55,19 @@ pub struct ListState<'a> {
     pub filter: Filter,
     pub search: &'a mut String,
     pub selected: Option<DownloadId>,
+    pub order: ListOrder,
 }
 
 pub fn show(ui: &mut Ui, state: ListState<'_>, actions: &mut Vec<Action>) {
-    toolbar(ui, state.search, actions);
+    toolbar(
+        ui,
+        state.search,
+        sorting_for(state.filter, state.order),
+        actions,
+    );
     ui.add_space(18.0);
 
-    let visible = visible_downloads(state.downloads, state.filter, state.search);
+    let visible = visible_downloads(state.downloads, state.filter, state.search, state.order);
     let completed = visible
         .iter()
         .filter(|download| download.status == DownloadStatus::Completed)
@@ -100,7 +113,8 @@ fn download_rows(
     }
     let geometry = RowGeometry::for_style(style);
     let columns = Columns::for_width(geometry.content_width(ui.available_width()));
-    header(ui, &columns, style, geometry);
+    let sorting = sorting_for(state.filter, state.order);
+    header(ui, &columns, style, geometry, sorting, actions);
     let rows = RowList {
         catalog: state.catalog,
         columns: &columns,
@@ -113,7 +127,7 @@ fn download_rows(
             ui.add_space(geometry.edge_room());
             // A queue view shows the start order, so its rows can be
             // dragged and moved; other views are filtered lists.
-            let in_queue = matches!(state.filter, Filter::Queue(_));
+            let in_queue = matches!(sorting, Sorting::StartOrderOnly);
             let first = visible.first().map(|download| download.id);
             for (index, download) in visible.iter().enumerate() {
                 let reorder = match first {
@@ -142,11 +156,87 @@ pub fn visible_downloads<'a>(
     downloads: &'a [DownloadView],
     filter: Filter,
     search: &str,
+    order: ListOrder,
 ) -> Vec<&'a DownloadView> {
-    downloads
+    let mut visible: Vec<&DownloadView> = downloads
         .iter()
         .filter(|download| filter.includes(download) && matches_search(download, search))
-        .collect()
+        .collect();
+    if let Sorting::Sortable(order) = sorting_for(filter, order) {
+        sort_downloads(&mut visible, order);
+    }
+    visible
+}
+
+/// Whether this view can be sorted. A queue view shows the start order,
+/// which its rows are dragged to change.
+fn sorting_for(filter: Filter, order: ListOrder) -> Sorting {
+    match filter {
+        Filter::Queue(_) => Sorting::StartOrderOnly,
+        _ => Sorting::Sortable(order),
+    }
+}
+
+/// Sorts by the chosen column; downloads that compare equal keep their
+/// start order, and values not known yet (a size the server never sent)
+/// go last in either direction.
+fn sort_downloads(downloads: &mut [&DownloadView], order: ListOrder) {
+    let ListOrder::Column { column, direction } = order else {
+        return;
+    };
+    downloads.sort_by(|a, b| {
+        let unknown = is_unknown(a, column).cmp(&is_unknown(b, column));
+        unknown.then_with(|| {
+            let ascending = compare_ascending(a, b, column);
+            match direction {
+                SortDirection::Ascending => ascending,
+                SortDirection::Descending => ascending.reverse(),
+            }
+        })
+    });
+}
+
+fn is_unknown(download: &DownloadView, column: SortColumn) -> bool {
+    match column {
+        SortColumn::Size => download.size.is_none(),
+        SortColumn::Progress => download.progress_fraction.is_none(),
+        SortColumn::Finished => download.finished_at_unix.is_none(),
+        SortColumn::Name | SortColumn::Speed | SortColumn::Status | SortColumn::Added => false,
+    }
+}
+
+fn compare_ascending(a: &DownloadView, b: &DownloadView, column: SortColumn) -> Ordering {
+    match column {
+        // Compared letter by letter: the list sorts on every frame.
+        SortColumn::Name => a
+            .file_name
+            .chars()
+            .flat_map(char::to_lowercase)
+            .cmp(b.file_name.chars().flat_map(char::to_lowercase)),
+        SortColumn::Size => a.size.cmp(&b.size),
+        SortColumn::Progress => {
+            let fraction = |download: &DownloadView| download.progress_fraction.unwrap_or(0.0);
+            fraction(a).total_cmp(&fraction(b))
+        }
+        SortColumn::Speed => a.bytes_per_second.cmp(&b.bytes_per_second),
+        SortColumn::Status => activity_rank(&a.status).cmp(&activity_rank(&b.status)),
+        SortColumn::Added => a.added_at_unix.cmp(&b.added_at_unix),
+        SortColumn::Finished => a.finished_at_unix.cmp(&b.finished_at_unix),
+    }
+}
+
+/// Status sorts by how much a download is doing: transferring first,
+/// finished last.
+fn activity_rank(status: &DownloadStatus) -> u8 {
+    match status {
+        DownloadStatus::Downloading => 0,
+        DownloadStatus::Connecting => 1,
+        DownloadStatus::Queued => 2,
+        DownloadStatus::WaitingForSpace { .. } => 3,
+        DownloadStatus::Paused => 4,
+        DownloadStatus::Failed { .. } => 5,
+        DownloadStatus::Completed => 6,
+    }
 }
 
 /// Which way the arrow keys move the selection.
@@ -188,9 +278,10 @@ pub const ADD_LINKS_HELP: &str =
     "Paste many links (or a whole page of text): Downpour checks which \
      files are still online, and you pick the ones to download.";
 
-/// Search on the left, bulk actions on the right. When the panel is too
-/// narrow for labeled buttons, the bulk actions collapse to icon buttons.
-fn toolbar(ui: &mut Ui, search: &mut String, actions: &mut Vec<Action>) {
+/// Search and the Sort menu on the left, bulk actions on the right. When the
+/// panel is too narrow for labeled buttons, the bulk actions collapse to icon
+/// buttons.
+fn toolbar(ui: &mut Ui, search: &mut String, sorting: Sorting, actions: &mut Vec<Action>) {
     let add_url = hotkeys::ADD_URL.label("Add URL");
     let add_links = hotkeys::ADD_LINKS.label("Add links");
     let resume_all = hotkeys::RESUME_ALL.label("Resume all");
@@ -204,15 +295,19 @@ fn toolbar(ui: &mut Ui, search: &mut String, actions: &mut Vec<Action>) {
         + button_width(ui, Some(Icon::Pause), &pause_all)
         + gap * 2.0;
     let compact_width = add_width + 2.0 * 32.0 + gap * 2.0;
-    let available = ui.available_width();
-    let labeled = available - labeled_width - 24.0 >= SEARCH_MIN_WIDTH;
+    let sort_width = match sorting {
+        Sorting::Sortable(_) => SORT_MENU_WIDTH + gap,
+        Sorting::StartOrderOnly => 0.0,
+    };
+    let available = ui.available_width() - sort_width;
+    let labeled = available - labeled_width - TOOLBAR_GAP >= SEARCH_LABELED_MIN_WIDTH;
     let buttons_width = if labeled {
         labeled_width
     } else {
         compact_width
     };
-    let search_width =
-        (available - buttons_width - 24.0).clamp(SEARCH_MIN_WIDTH.min(available), SEARCH_MAX_WIDTH);
+    let search_width = (available - buttons_width - TOOLBAR_GAP)
+        .clamp(SEARCH_MIN_WIDTH.min(available), SEARCH_MAX_WIDTH);
 
     ui.horizontal(|ui| {
         let field = widgets::text_field(
@@ -224,6 +319,9 @@ fn toolbar(ui: &mut Ui, search: &mut String, actions: &mut Vec<Action>) {
         );
         if hotkeys::take_search_focus_request(ui.ctx()) {
             field.request_focus();
+        }
+        if let Sorting::Sortable(order) = sorting {
+            sort_menu(ui, order, actions);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if button(ui, ButtonKind::Primary, Some(Icon::Plus), &add_url)
@@ -255,6 +353,49 @@ fn toolbar(ui: &mut Ui, search: &mut String, actions: &mut Vec<Action>) {
             }
         });
     });
+}
+
+const SORT_MENU_WIDTH: f32 = 190.0;
+
+/// Every way the list sorts, including dates, which have no column. Picking
+/// the current one turns the order around.
+fn sort_menu(ui: &mut Ui, order: ListOrder, actions: &mut Vec<Action>) {
+    let current = match order {
+        ListOrder::StartOrder => "Sort: Start order".to_owned(),
+        ListOrder::Column { column, direction } => {
+            format!("Sort: {}{}", column.label(), direction_arrow(direction))
+        }
+    };
+    widgets::dropdown(ui, "list-sort", SORT_MENU_WIDTH, &current, |ui| {
+        let start_order = order == ListOrder::StartOrder;
+        if ui.selectable_label(start_order, "Start order").clicked() {
+            actions.push(Action::SetListOrder(ListOrder::StartOrder));
+        }
+        for column in SortColumn::ALL {
+            let label = match order {
+                ListOrder::Column {
+                    column: sorted,
+                    direction,
+                } if sorted == column => {
+                    format!("{}{}", column.label(), direction_arrow(direction))
+                }
+                _ => column.label().to_owned(),
+            };
+            let chosen =
+                matches!(order, ListOrder::Column { column: sorted, .. } if sorted == column);
+            if ui.selectable_label(chosen, label).clicked() {
+                actions.push(Action::SetListOrder(order.after_choosing(column)));
+            }
+        }
+    })
+    .on_hover_text("Sort the list. Pick the current choice again to reverse it.");
+}
+
+fn direction_arrow(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::Ascending => " ↑",
+        SortDirection::Descending => " ↓",
+    }
 }
 
 /// How many downloads the view shows, and how many of those are finished.
@@ -606,30 +747,48 @@ struct ColumnOffsets {
     status: f32,
 }
 
-fn header(ui: &mut Ui, columns: &Columns, style: RowStyle, geometry: RowGeometry) {
+/// Whether the column headings sort the list.
+#[derive(Clone, Copy)]
+enum Sorting {
+    Sortable(ListOrder),
+    /// A queue view: rows show, and are dragged to change, the start order.
+    StartOrderOnly,
+}
+
+fn header(
+    ui: &mut Ui,
+    columns: &Columns,
+    style: RowStyle,
+    geometry: RowGeometry,
+    sorting: Sorting,
+    actions: &mut Vec<Action>,
+) {
     let (slot, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
     // Column names line up with the row content, inside any row card.
     let rect = slot.shrink2(vec2(geometry.padding, 0.0));
     let offsets = columns.offsets();
-    let label = |x: f32, text: &str| {
-        let text = galley(ui, text, theme::semibold(11.5), theme::ink_faint());
-        ui.painter().galley(
-            pos2(rect.left() + x, rect.center().y - text.size().y / 2.0),
-            text,
-            theme::ink_faint(),
-        );
+    let optional = |x: Option<f32>, width: Option<f32>, title, column| {
+        x.zip(width).map(|(x, width)| (x, width, title, column))
     };
-    label(offsets.name, "NAME");
-    for (offset, title) in [
-        (offsets.size, "SIZE"),
-        (offsets.progress, "PROGRESS"),
-        (offsets.speed, "SPEED"),
-    ] {
-        if let Some(x) = offset {
-            label(x, title);
-        }
+    let headings = [
+        Some((offsets.name, columns.name, "NAME", SortColumn::Name)),
+        optional(offsets.size, columns.size, "SIZE", SortColumn::Size),
+        optional(
+            offsets.progress,
+            columns.progress,
+            "PROGRESS",
+            SortColumn::Progress,
+        ),
+        optional(offsets.speed, columns.speed, "SPEED", SortColumn::Speed),
+        Some((offsets.status, STATUS_WIDTH, "STATUS", SortColumn::Status)),
+    ];
+    for (x, width, title, column) in headings.into_iter().flatten() {
+        let area = Rect::from_min_size(
+            pos2(rect.left() + x, rect.top()),
+            vec2(width, rect.height()),
+        );
+        column_heading(ui, area, title, column, sorting, actions);
     }
-    label(offsets.status, "STATUS");
     match style {
         RowStyle::Lines => {
             ui.painter().line_segment(
@@ -644,6 +803,55 @@ fn header(ui: &mut Ui, columns: &Columns, style: RowStyle, geometry: RowGeometry
         RowStyle::Cards | RowStyle::Bands => {}
     }
     ui.add_space(4.0);
+}
+
+/// One column's title; where the list can be sorted, a click sorts by it and
+/// an arrow marks the column it is sorted by.
+fn column_heading(
+    ui: &mut Ui,
+    area: Rect,
+    title: &str,
+    column: SortColumn,
+    sorting: Sorting,
+    actions: &mut Vec<Action>,
+) {
+    let id = ui.id().with(("sort-heading", title));
+    let (text, color) = match sorting {
+        Sorting::StartOrderOnly => {
+            ui.interact(area, id, Sense::hover()).on_hover_text(
+                "A queue lists its start order. Sort in All downloads or another view.",
+            );
+            (title.to_owned(), theme::ink_faint())
+        }
+        Sorting::Sortable(order) => {
+            let response = ui
+                .interact(area, id, Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                actions.push(Action::SortBy(column));
+            }
+            let arrow = match order {
+                ListOrder::Column {
+                    column: sorted,
+                    direction,
+                } if sorted == column => direction_arrow(direction),
+                _ => "",
+            };
+            let color = if response.hovered() || !arrow.is_empty() {
+                theme::ink_soft()
+            } else {
+                theme::ink_faint()
+            };
+            response.on_hover_text(format!("Sort by {}", title.to_lowercase()));
+            (format!("{title}{arrow}"), color)
+        }
+    };
+    let text = galley(ui, text, theme::semibold(11.5), color);
+    ui.painter().galley(
+        pos2(area.left(), area.center().y - text.size().y / 2.0),
+        text,
+        color,
+    );
 }
 
 /// Where a row's parts sit inside the slot it takes in the list.
@@ -950,8 +1158,8 @@ fn row(
     }
     response.context_menu(|ui| row_menu(ui, download, catalog, reorder, actions));
     if response.double_clicked() {
-        if let (DownloadStatus::Completed, Some(target)) = (&download.status, &download.target) {
-            actions.push(Action::OpenFile(target.clone()));
+        if let Some(file) = download.finished_file() {
+            actions.push(Action::OpenFile(file.to_path_buf()));
         }
     } else if response.clicked() {
         actions.push(Action::Select(Some(download.id)));
@@ -1036,14 +1244,20 @@ fn row_menu(
     actions: &mut Vec<Action>,
 ) {
     ui.set_min_width(220.0);
-    if let (DownloadStatus::Completed, Some(target)) = (&download.status, &download.target) {
+    if let Some(file) = download.finished_file() {
         menu_item(
             ui,
             actions,
             &hotkeys::OPEN_FILE.label("Open file"),
-            Action::OpenFile(target.clone()),
+            Action::OpenFile(file.to_path_buf()),
         );
     }
+    menu_item(
+        ui,
+        actions,
+        &hotkeys::RENAME.label("Rename file"),
+        Action::AskRename(download.id),
+    );
     menu_item(
         ui,
         actions,
@@ -1236,8 +1450,8 @@ fn inline_progress_text(download: &DownloadView) -> String {
     let amount = match download.size {
         Some(size) if download.status == DownloadStatus::Completed => format::bytes(size),
         Some(size) => format!(
-            "{:.0}% of {}",
-            download.fraction().unwrap_or(0.0) * 100.0,
+            "{} of {}",
+            format::percent(download.fraction().unwrap_or(0.0)),
             format::bytes(size)
         ),
         None => format::bytes(download.received),
@@ -1282,7 +1496,7 @@ fn progress_cell(ui: &Ui, download: &DownloadView, cell: Rect) {
     let middle = cell.center().y;
     let color = theme::status_colors(&download.status).0;
     let label = match download.fraction() {
-        Some(fraction) => format!("{:.0}%", fraction * 100.0),
+        Some(fraction) => format::percent(fraction),
         None => format::bytes(download.received),
     };
     let detail = match (download.size, &download.status) {
@@ -1412,6 +1626,100 @@ mod tests {
             kib_per_second: NonZeroU32::new(300).unwrap(),
         };
         assert_eq!(speed_limit_choices(odd).last(), Some(&odd));
+    }
+
+    fn named(id: u64, name: &str) -> DownloadView {
+        DownloadView {
+            file_name: name.to_owned(),
+            ..view(id)
+        }
+    }
+
+    fn ids(downloads: &[&DownloadView]) -> Vec<u64> {
+        downloads.iter().map(|download| download.id.0).collect()
+    }
+
+    fn sorted_by(
+        downloads: &[DownloadView],
+        column: SortColumn,
+        direction: SortDirection,
+    ) -> Vec<u64> {
+        let order = ListOrder::Column { column, direction };
+        ids(&visible_downloads(downloads, Filter::All, "", order))
+    }
+
+    #[test]
+    fn names_sort_ignoring_case() {
+        let downloads = [
+            named(1, "beta.zip"),
+            named(2, "Alpha.zip"),
+            named(3, "gamma.zip"),
+        ];
+        assert_eq!(
+            sorted_by(&downloads, SortColumn::Name, SortDirection::Ascending),
+            [2, 1, 3]
+        );
+        assert_eq!(
+            sorted_by(&downloads, SortColumn::Name, SortDirection::Descending),
+            [3, 1, 2]
+        );
+    }
+
+    #[test]
+    fn unknown_sizes_go_last_in_either_direction() {
+        let sized = |id, size| DownloadView { size, ..view(id) };
+        let downloads = [sized(1, None), sized(2, Some(10)), sized(3, Some(30))];
+        assert_eq!(
+            sorted_by(&downloads, SortColumn::Size, SortDirection::Ascending),
+            [2, 3, 1]
+        );
+        assert_eq!(
+            sorted_by(&downloads, SortColumn::Size, SortDirection::Descending),
+            [3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn status_sorts_active_downloads_first_and_ties_keep_the_start_order() {
+        let with = |id, status| DownloadView { status, ..view(id) };
+        let downloads = [
+            with(1, DownloadStatus::Completed),
+            with(2, DownloadStatus::Paused),
+            with(3, DownloadStatus::Downloading),
+            with(4, DownloadStatus::Paused),
+        ];
+        assert_eq!(
+            sorted_by(&downloads, SortColumn::Status, SortDirection::Ascending),
+            [3, 2, 4, 1]
+        );
+    }
+
+    #[test]
+    fn the_start_order_shows_the_list_as_it_is() {
+        let downloads = [named(1, "b"), named(2, "a")];
+        assert_eq!(
+            ids(&visible_downloads(
+                &downloads,
+                Filter::All,
+                "",
+                ListOrder::StartOrder
+            )),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn a_queue_view_keeps_its_start_order_whatever_the_sort() {
+        let downloads = [named(1, "b"), named(2, "a")];
+        let order = ListOrder::Column {
+            column: SortColumn::Name,
+            direction: SortDirection::Ascending,
+        };
+        let queue = Filter::Queue(downpour_core::QueueId::MAIN);
+        assert_eq!(
+            ids(&visible_downloads(&downloads, queue, "", order)),
+            [1, 2]
+        );
     }
 
     fn view(id: u64) -> DownloadView {

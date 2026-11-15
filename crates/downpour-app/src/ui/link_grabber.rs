@@ -445,6 +445,10 @@ mod tests {
         )
         .link;
         let request = request_for(&link, None, QueueId::MAIN, StartMode::Queue);
-        assert!(request.file_name.unwrap().is_replaceable_by_server());
+        let guessed = request.file_name.unwrap();
+        assert_eq!(
+            guessed.after_response(Some("real.zip"), &url).value,
+            "real.zip"
+        );
     }
 }

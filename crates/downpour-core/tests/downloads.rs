@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use downpour_core::{
-    DownloadManager, DownloadStatus, EngineSettings, NewDownload, StartMode, Store,
+    DownloadManager, DownloadStatus, EngineSettings, FileName, FileNameSource, NewDownload,
+    RenameError, Renamed, StartMode, Store,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -186,6 +187,14 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 fn manager_in(dir: &Path, connections: u8) -> DownloadManager {
+    manager_with_saved_list(dir, connections, Vec::new())
+}
+
+fn manager_with_saved_list(
+    dir: &Path,
+    connections: u8,
+    records: Vec<downpour_core::record::DownloadRecord>,
+) -> DownloadManager {
     let settings = EngineSettings {
         download_dir: dir.join("downloads"),
         organize_by_category: false,
@@ -193,13 +202,15 @@ fn manager_in(dir: &Path, connections: u8) -> DownloadManager {
         ..Default::default()
     };
     let store = Store::open(dir.join("state")).unwrap();
-    DownloadManager::start(
-        store,
-        Vec::new(),
-        settings,
-        tokio::runtime::Handle::current(),
-    )
-    .unwrap()
+    DownloadManager::start(store, records, settings, tokio::runtime::Handle::current()).unwrap()
+}
+
+/// A name as versions that did not clean web escapes saved it.
+fn escaped_browser_name(value: &str) -> FileName {
+    FileName {
+        value: value.to_owned(),
+        source: FileNameSource::Browser,
+    }
 }
 
 async fn wait_for(
@@ -397,6 +408,363 @@ async fn server_without_ranges_streams_whole_file() {
 
     assert_eq!(view.resumable, Some(false));
     assert_eq!(std::fs::read(view.target.unwrap()).unwrap(), *body);
+}
+
+/// Answers every request to `path` with a small body and the given
+/// `Content-Disposition`.
+async fn serve_with_content_disposition(path: &str, header: &'static str) -> Url {
+    serve_redirect(path, None, header).await
+}
+
+/// Like [`serve_with_content_disposition`], with requests to `path` sent on to
+/// `redirect_to` when it is given.
+async fn serve_redirect(
+    path: &str,
+    redirect_to: Option<&'static str>,
+    header: &'static str,
+) -> Url {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = Url::parse(&format!("http://{}{path}", listener.local_addr().unwrap())).unwrap();
+    let start = url.path().to_owned();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buffer = [0u8; 1024];
+            let read = socket.read(&mut buffer).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            let requested = request.split_whitespace().nth(1).unwrap_or("/");
+            let reply = match redirect_to {
+                Some(target) if requested == start => format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+                _ => format!(
+                    "HTTP/1.1 200 OK\r\nContent-Disposition: {header}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nclip"
+                ),
+            };
+            let _ = socket.write_all(reply.as_bytes()).await;
+        }
+    });
+    url
+}
+
+/// The name a download of `url` is saved under, starting from `preset`.
+async fn saved_name(case: &str, url: Url, preset: Option<FileName>) -> String {
+    let dir = temp_dir(&format!("server-name-{case}"));
+    let manager = manager_in(&dir, 1);
+
+    manager
+        .add(NewDownload {
+            file_name: preset,
+            ..NewDownload::from_user(url, None, None, StartMode::Queue)
+        })
+        .unwrap();
+    let view = wait_for(&manager, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Completed
+    })
+    .await;
+
+    let path = view.target.unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"clip", "{case}");
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(view.file_name, name, "the list must show the saved name");
+    name
+}
+
+const BLANK_NAME_HEADERS: [(&str, &str); 4] = [
+    ("quoted-empty", r#"attachment; filename="""#),
+    ("escaped-space", r#"attachment; filename="%20""#),
+    ("only-dots", r#"attachment; filename="...""#),
+    ("extended-empty", "attachment; filename*=UTF-8''"),
+];
+
+const REAL_NAME_HEADER: &str = r#"attachment; filename="Real%20Name.mp4""#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blank_server_name_keeps_the_name_in_the_url() {
+    for (case, header) in BLANK_NAME_HEADERS {
+        let url = serve_with_content_disposition("/files/clip.mp4", header).await;
+        let name = saved_name(&format!("url-{case}"), url, None).await;
+        assert_eq!(name, "clip.mp4", "{case}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blank_server_name_with_no_name_in_the_url_saves_as_unnamed() {
+    for (case, header) in BLANK_NAME_HEADERS {
+        let url = serve_with_content_disposition("/", header).await;
+        let name = saved_name(&format!("bare-{case}"), url, None).await;
+        assert_eq!(name, "unnamed", "{case}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_raw_non_ascii_server_name_is_used() {
+    let header = "attachment; filename=\"na\u{ef}ve clip.mp4\"";
+    let url = serve_with_content_disposition("/files/get", header).await;
+    assert_eq!(saved_name("raw", url, None).await, "na\u{ef}ve clip.mp4");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_typed_name_of_nothing_lets_the_server_name_the_file() {
+    let url = serve_with_content_disposition("/files/clip.mp4", REAL_NAME_HEADER).await;
+    let dir = temp_dir("typed-nothing");
+    let manager = manager_in(&dir, 1);
+
+    manager
+        .add(NewDownload::from_user(
+            url,
+            Some("..."),
+            None,
+            StartMode::Queue,
+        ))
+        .unwrap();
+    let view = wait_for(&manager, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Completed
+    })
+    .await;
+
+    assert_eq!(view.file_name, "Real Name.mp4");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_download_of_a_name_shows_the_numbered_name_it_saved_under() {
+    let (_, blank) = BLANK_NAME_HEADERS[0];
+    let url = serve_with_content_disposition("/files/clip.mp4", blank).await;
+    let dir = temp_dir("collision");
+    let manager = manager_in(&dir, 1);
+    let completed = |v: &downpour_core::DownloadView| v.status == DownloadStatus::Completed;
+    let timeout = Duration::from_secs(30);
+
+    let request = || NewDownload::from_user(url.clone(), None, None, StartMode::Queue);
+    let first = manager.add(request()).unwrap();
+    wait_for_download(&manager, first, timeout, completed).await;
+    let second = manager.add(request()).unwrap();
+    let view = wait_for_download(&manager, second, timeout, completed).await;
+
+    assert_eq!(view.file_name, "clip (1).mp4");
+    assert_eq!(view.target.unwrap().file_name().unwrap(), "clip (1).mp4");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_url_ending_in_download_is_a_real_name() {
+    let (_, blank) = BLANK_NAME_HEADERS[0];
+    let url = serve_with_content_disposition("/files/download", blank).await;
+    assert_eq!(saved_name("literal", url, None).await, "download");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_server_name_beats_the_name_in_the_url() {
+    let url = serve_with_content_disposition("/files/clip.mp4", REAL_NAME_HEADER).await;
+    assert_eq!(saved_name("real", url, None).await, "Real Name.mp4");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_someone_chose_beats_every_server_answer() {
+    let (_, blank) = BLANK_NAME_HEADERS[0];
+    let sources = [
+        ("typed", FileNameSource::User),
+        ("browser", FileNameSource::Browser),
+    ];
+    for (who, source) in sources {
+        for (answer, header) in [("real", REAL_NAME_HEADER), ("blank", blank)] {
+            let url = serve_with_content_disposition("/files/clip.mp4", header).await;
+            let chosen = FileName::new("mine.mp4", source);
+            let name = saved_name(&format!("{who}-{answer}"), url, Some(chosen)).await;
+            assert_eq!(name, "mine.mp4", "{who} against a {answer} header");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redirect_supplies_the_name_only_when_the_link_has_none() {
+    let (_, blank) = BLANK_NAME_HEADERS[0];
+    let bare = serve_redirect("/", Some("/files/clip.mp4"), blank).await;
+    assert_eq!(saved_name("to-named", bare, None).await, "clip.mp4");
+    let named = serve_redirect("/files/clip.mp4", Some("/opaque"), blank).await;
+    assert_eq!(saved_name("from-named", named, None).await, "clip.mp4");
+}
+
+/// A server without ranges whose first response has a blank name and stalls
+/// partway, and whose later responses name the file `Real Name.mp4`.
+async fn serve_blank_name_then_real_name(body_len: usize) -> Url {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = Url::parse(&format!(
+        "http://{}/files/clip.mp4",
+        listener.local_addr().unwrap()
+    ))
+    .unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let is_first = requests.fetch_add(1, Ordering::SeqCst) == 0;
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 1024];
+                let _ = socket.read(&mut buffer).await;
+                let header = if is_first {
+                    r#"attachment; filename="""#
+                } else {
+                    REAL_NAME_HEADER
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Disposition: {header}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let sent = if is_first { body_len / 2 } else { body_len };
+                let _ = socket.write_all(&vec![7u8; sent]).await;
+                if is_first {
+                    // Held open so the download is still running when paused.
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            });
+        }
+    });
+    url
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_keeps_the_name_of_the_file_already_on_disk() {
+    let url = serve_blank_name_then_real_name(64 * 1024).await;
+    let dir = temp_dir("restart-name");
+    let manager = manager_in(&dir, 1);
+
+    let id = manager
+        .add(NewDownload::from_user(url, None, None, StartMode::Queue))
+        .unwrap();
+    wait_for(&manager, Duration::from_secs(30), |v| {
+        v.target.is_some() && v.received > 0
+    })
+    .await;
+    manager.pause(id).unwrap();
+    wait_for(&manager, Duration::from_secs(10), |v| {
+        v.status == DownloadStatus::Paused
+    })
+    .await;
+    manager.resume(id).unwrap();
+    let view = wait_for(&manager, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Completed
+    })
+    .await;
+
+    let saved = view.target.unwrap();
+    assert_eq!(saved.file_name().unwrap(), "clip.mp4");
+    assert_eq!(view.file_name, "clip.mp4");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_half_finished_download_saved_with_escapes_finishes_with_a_clean_name() {
+    let body = sample_body(8 * 1024 * 1024);
+    let server = serve(Arc::clone(&body), RangeSupport::Ranges).await;
+    let dir = temp_dir("escaped-resume");
+    let manager = manager_in(&dir, 4);
+    let id = manager
+        .add(NewDownload::from_user(
+            server.url.clone(),
+            Some("placeholder.bin"),
+            None,
+            StartMode::Queue,
+        ))
+        .unwrap();
+    wait_for(&manager, Duration::from_secs(30), |v| {
+        v.received > 1024 * 1024
+    })
+    .await;
+    manager.pause(id).unwrap();
+    let paused = wait_for(&manager, Duration::from_secs(10), |v| {
+        v.status == DownloadStatus::Paused
+    })
+    .await;
+    assert!(
+        paused.received < body.len() as u64,
+        "paused before completion"
+    );
+    manager.shutdown(Duration::from_secs(5));
+    drop(manager);
+
+    let store = Store::open(dir.join("state")).unwrap();
+    let mut records = store.load_downloads().unwrap();
+    let old_target = dir.join("downloads").join("My%20Clip.bin");
+    std::fs::rename(
+        downpour_core::record::part_path(records[0].target.as_ref().unwrap()),
+        downpour_core::record::part_path(&old_target),
+    )
+    .unwrap();
+    records[0].file_name = escaped_browser_name("My%20Clip.bin");
+    records[0].target = Some(old_target.clone());
+
+    let restarted = manager_with_saved_list(&dir, 4, records);
+    restarted.resume(id).unwrap();
+    let finished = wait_for(&restarted, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Completed
+    })
+    .await;
+
+    let saved = finished.target.unwrap();
+    assert_eq!(saved.file_name().unwrap(), "My Clip.bin");
+    assert_eq!(finished.file_name, "My Clip.bin");
+    assert_eq!(std::fs::read(saved).unwrap(), *body);
+    assert!(!downpour_core::record::part_path(&old_target).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarting_cleans_waiting_names_but_not_typed_or_finished_ones() {
+    let server = serve(sample_body(1024), RangeSupport::Ranges).await;
+    let dir = temp_dir("escaped-list");
+    let manager = manager_in(&dir, 1);
+    let waiting = manager
+        .add(NewDownload::from_user(
+            server.url.clone(),
+            None,
+            None,
+            StartMode::Hold,
+        ))
+        .unwrap();
+    let typed = manager
+        .add(NewDownload::from_user(
+            server.url.clone(),
+            Some("100%20.bin"),
+            None,
+            StartMode::Hold,
+        ))
+        .unwrap();
+    let finished = manager
+        .add(NewDownload::from_user(
+            server.url.clone(),
+            None,
+            None,
+            StartMode::Hold,
+        ))
+        .unwrap();
+    manager.shutdown(Duration::from_secs(5));
+    drop(manager);
+
+    let store = Store::open(dir.join("state")).unwrap();
+    let mut records = store.load_downloads().unwrap();
+    for record in &mut records {
+        if record.id == waiting {
+            record.file_name = escaped_browser_name("Waiting%20Clip.bin");
+        } else if record.id == finished {
+            let done = dir.join("downloads").join("Done%20Clip.bin");
+            record.file_name = escaped_browser_name("Done%20Clip.bin");
+            record.target = Some(done);
+            record.status = DownloadStatus::Completed;
+        }
+    }
+
+    let restarted = manager_with_saved_list(&dir, 1, records);
+    let name_of = |id| {
+        restarted
+            .snapshot()
+            .into_iter()
+            .find(|view| view.id == id)
+            .unwrap()
+            .file_name
+    };
+    assert_eq!(name_of(waiting), "Waiting Clip.bin");
+    assert_eq!(name_of(typed), "100%20.bin");
+    assert_eq!(name_of(finished), "Done%20Clip.bin");
+
+    let on_disk = store.load_downloads().unwrap();
+    let saved = on_disk.iter().find(|record| record.id == waiting).unwrap();
+    assert_eq!(saved.file_name.value, "Waiting Clip.bin");
 }
 
 async fn wait_for_download(
@@ -883,4 +1251,408 @@ async fn start_now_runs_a_download_past_a_full_queue() {
         .find(|v| v.id == slow)
         .unwrap();
     assert!(first.status.is_active(), "the slow download keeps running");
+}
+
+/// A finished download of a small file, and the manager that holds it.
+async fn finished_download(case: &str) -> (DownloadManager, downpour_core::DownloadView, PathBuf) {
+    let body = sample_body(64 * 1024);
+    let server = serve(body, RangeSupport::Ranges).await;
+    let dir = temp_dir(case);
+    let manager = manager_in(&dir, 1);
+    manager
+        .add(NewDownload::from_user(
+            server.url.clone(),
+            None,
+            None,
+            StartMode::Queue,
+        ))
+        .unwrap();
+    let view = wait_for(&manager, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Completed
+    })
+    .await;
+    (manager, view, dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_file_is_renamed_in_its_folder() {
+    let (manager, view, _dir) = finished_download("rename").await;
+    let before = view.target.clone().unwrap();
+
+    let Renamed::Now(renamed) = manager.rename_file(view.id, "Holiday clip.bin").unwrap() else {
+        panic!("a finished file is renamed at once");
+    };
+
+    assert_eq!(renamed, before.with_file_name("Holiday clip.bin"));
+    assert!(renamed.is_file());
+    assert!(!before.exists());
+    let shown = manager.snapshot().into_iter().next().unwrap();
+    assert_eq!(shown.file_name, "Holiday clip.bin");
+    assert_eq!(shown.target.as_deref(), Some(renamed.as_path()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renaming_a_moved_file_says_where_it_was_expected() {
+    let (manager, view, _dir) = finished_download("rename-moved").await;
+    let target = view.target.clone().unwrap();
+    std::fs::remove_file(&target).unwrap();
+
+    let error = manager.rename_file(view.id, "new.bin").unwrap_err();
+
+    assert!(matches!(&error, RenameError::FileMissing(path) if *path == target));
+    assert!(error.to_string().contains("moved or deleted"), "{error}");
+    assert_eq!(
+        manager.snapshot()[0].target.as_deref(),
+        Some(target.as_path())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renaming_never_replaces_another_file() {
+    let (manager, view, _dir) = finished_download("rename-taken").await;
+    let target = view.target.clone().unwrap();
+    let other = target.with_file_name("other.bin");
+    std::fs::write(&other, b"keep me").unwrap();
+
+    let error = manager.rename_file(view.id, "other.bin").unwrap_err();
+
+    assert!(matches!(&error, RenameError::NameTaken(path) if *path == other));
+    assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
+    assert!(target.is_file());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_takes_only_a_name() {
+    let (manager, view, _dir) = finished_download("rename-name").await;
+
+    assert!(matches!(
+        manager.rename_file(view.id, "sub/clip.bin"),
+        Err(RenameError::NameHasFolder)
+    ));
+    assert!(matches!(
+        manager.rename_file(view.id, "   "),
+        Err(RenameError::UnusableName(_))
+    ));
+    assert!(view.target.unwrap().is_file());
+}
+
+/// A download held to 1 KiB/s once its transfer reserved a name, so a test
+/// can act while it runs. Lift the limit to let it finish.
+async fn running_download(case: &str) -> RunningDownload {
+    let server = serve(sample_body(64 * 1024), RangeSupport::Ranges).await;
+    let dir = temp_dir(case);
+    let manager = manager_in(&dir, 1);
+    let id = start_slowly(&manager, &server).await;
+    let reserved = manager.snapshot()[0].target.clone().unwrap();
+    RunningDownload {
+        manager,
+        id,
+        reserved,
+        dir,
+        _server: server,
+    }
+}
+
+struct RunningDownload {
+    manager: DownloadManager,
+    id: downpour_core::DownloadId,
+    /// The name its transfer writes under.
+    reserved: PathBuf,
+    dir: PathBuf,
+    _server: TestServer,
+}
+
+/// Adds a download of `server`'s file at 1 KiB/s and waits until its
+/// transfer reserved a name.
+async fn start_slowly(manager: &DownloadManager, server: &TestServer) -> downpour_core::DownloadId {
+    let id = manager
+        .add(NewDownload::from_user(
+            server.url.clone(),
+            None,
+            None,
+            StartMode::Hold,
+        ))
+        .unwrap();
+    let slow = downpour_core::limiter::DownloadLimit::Limited {
+        kib_per_second: std::num::NonZeroU32::MIN,
+    };
+    manager.set_speed_limit(id, slow).unwrap();
+    manager.resume(id).unwrap();
+    wait_for_download(manager, id, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Downloading && v.target.is_some()
+    })
+    .await;
+    id
+}
+
+async fn finish(
+    manager: &DownloadManager,
+    id: downpour_core::DownloadId,
+) -> downpour_core::DownloadView {
+    manager
+        .set_speed_limit(id, downpour_core::limiter::DownloadLimit::Unlimited)
+        .unwrap();
+    wait_for(manager, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Completed
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_download_takes_its_new_name_when_finished() {
+    let RunningDownload {
+        manager,
+        id,
+        reserved,
+        ..
+    } = running_download("rename-running").await;
+
+    assert_eq!(
+        manager.rename_file(id, "Holiday clip.bin").unwrap(),
+        Renamed::WhenFinished("Holiday clip.bin".to_owned())
+    );
+    let running = manager.snapshot().into_iter().next().unwrap();
+    assert_eq!(running.file_name, "Holiday clip.bin");
+    assert_eq!(running.target.as_deref(), Some(reserved.as_path()));
+
+    let done = finish(&manager, id).await;
+    let renamed = reserved.with_file_name("Holiday clip.bin");
+    assert_eq!(done.target.as_deref(), Some(renamed.as_path()));
+    assert_eq!(done.file_name, "Holiday clip.bin");
+    assert_eq!(std::fs::metadata(&renamed).unwrap().len(), 64 * 1024);
+    assert!(!reserved.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_download_not_started_yet_takes_its_new_name_when_finished() {
+    let server = serve(sample_body(1024), RangeSupport::Ranges).await;
+    let manager = manager_in(&temp_dir("rename-held"), 1);
+    let id = manager
+        .add(NewDownload::from_user(
+            server.url.clone(),
+            None,
+            None,
+            StartMode::Hold,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        manager.rename_file(id, "clip.bin").unwrap(),
+        Renamed::WhenFinished("clip.bin".to_owned())
+    );
+    manager.resume(id).unwrap();
+    let done = wait_for(&manager, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Completed
+    })
+    .await;
+
+    let target = done.target.unwrap();
+    assert_eq!(target.file_name().unwrap(), "clip.bin");
+    assert!(target.is_file());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_taken_before_the_download_finishes_is_refused() {
+    let RunningDownload {
+        manager,
+        id,
+        reserved,
+        ..
+    } = running_download("rename-running-taken").await;
+    let other = reserved.with_file_name("other.bin");
+    std::fs::write(&other, b"keep me").unwrap();
+
+    let error = manager.rename_file(id, "other.bin").unwrap_err();
+
+    assert!(matches!(&error, RenameError::NameTaken(path) if *path == other));
+    let done = finish(&manager, id).await;
+    assert_eq!(done.target.as_deref(), Some(reserved.as_path()));
+    assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_taken_while_downloading_gets_a_number() {
+    let RunningDownload {
+        manager,
+        id,
+        reserved,
+        ..
+    } = running_download("rename-taken-later").await;
+    manager.rename_file(id, "other.bin").unwrap();
+    let other = reserved.with_file_name("other.bin");
+    std::fs::write(&other, b"keep me").unwrap();
+
+    let done = finish(&manager, id).await;
+
+    let numbered = reserved.with_file_name("other (1).bin");
+    assert_eq!(done.target.as_deref(), Some(numbered.as_path()));
+    assert_eq!(done.file_name, "other (1).bin");
+    assert!(numbered.is_file());
+    assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_chosen_while_paused_survives_a_restart() {
+    let RunningDownload {
+        manager,
+        id,
+        reserved,
+        dir,
+        _server,
+    } = running_download("rename-restart").await;
+    manager.pause(id).unwrap();
+    wait_for(&manager, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Paused
+    })
+    .await;
+    manager.rename_file(id, "kept.bin").unwrap();
+    manager.shutdown(Duration::from_secs(5));
+    drop(manager);
+
+    let saved = Store::open(dir.join("state"))
+        .unwrap()
+        .load_downloads()
+        .unwrap();
+    let reopened = manager_with_saved_list(&dir, 1, saved);
+    assert_eq!(reopened.snapshot()[0].file_name, "kept.bin");
+    reopened
+        .set_speed_limit(id, downpour_core::limiter::DownloadLimit::Unlimited)
+        .unwrap();
+    reopened.resume(id).unwrap();
+    let done = wait_for(&reopened, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Completed
+    })
+    .await;
+
+    let kept = reserved.with_file_name("kept.bin");
+    assert_eq!(done.target.as_deref(), Some(kept.as_path()));
+    assert_eq!(std::fs::metadata(&kept).unwrap().len(), 64 * 1024);
+}
+
+/// A manager that files downloads in category folders, and the folder a
+/// file named `name` is filed in.
+fn filing_manager(
+    dir: &Path,
+    records: Vec<downpour_core::record::DownloadRecord>,
+    name: &str,
+) -> (DownloadManager, PathBuf) {
+    let settings = EngineSettings {
+        download_dir: dir.join("downloads"),
+        organize_by_category: true,
+        connections_per_download: 1,
+        ..Default::default()
+    };
+    let folder = settings
+        .categories
+        .save_folder_for(name, &dir.join("downloads"));
+    let store = Store::open(dir.join("state")).unwrap();
+    let manager =
+        DownloadManager::start(store, records, settings, tokio::runtime::Handle::current())
+            .unwrap();
+    (manager, folder)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_download_not_started_yet_is_saved_in_its_new_names_category() {
+    let server = serve(sample_body(1024), RangeSupport::Ranges).await;
+    let dir = temp_dir("rename-category");
+    let (manager, expected_folder) = filing_manager(&dir, Vec::new(), "clip.zip");
+    let id = manager
+        .add(NewDownload::from_user(
+            server.url.clone(),
+            None,
+            None,
+            StartMode::Hold,
+        ))
+        .unwrap();
+
+    manager.rename_file(id, "clip.zip").unwrap();
+    manager.resume(id).unwrap();
+    let done = wait_for(&manager, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Completed
+    })
+    .await;
+
+    assert_eq!(
+        done.target.as_deref(),
+        Some(expected_folder.join("clip.zip").as_path())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_chosen_before_the_file_was_reserved_files_it_by_that_name() {
+    let server = serve(sample_body(1024), RangeSupport::Ranges).await;
+    let dir = temp_dir("rename-before-reserved");
+    let (manager, _) = filing_manager(&dir, Vec::new(), "clip.zip");
+    manager
+        .add(NewDownload::from_user(
+            server.url.clone(),
+            None,
+            None,
+            StartMode::Hold,
+        ))
+        .unwrap();
+    manager.shutdown(Duration::from_secs(5));
+    drop(manager);
+    // What renaming while the first run was still connecting leaves: the
+    // name waits for the finish, and no file was reserved.
+    let mut saved = Store::open(dir.join("state"))
+        .unwrap()
+        .load_downloads()
+        .unwrap();
+    saved[0].name_when_finished = FileName::from_typed("clip.zip");
+    assert_eq!(saved[0].target, None);
+
+    let (reopened, expected_folder) = filing_manager(&dir, saved, "clip.zip");
+    reopened.resume(saved_id(&reopened)).unwrap();
+    let done = wait_for(&reopened, Duration::from_secs(30), |v| {
+        v.status == DownloadStatus::Completed
+    })
+    .await;
+
+    assert_eq!(
+        done.target.as_deref(),
+        Some(expected_folder.join("clip.zip").as_path())
+    );
+}
+
+fn saved_id(manager: &DownloadManager) -> downpour_core::DownloadId {
+    manager.snapshot()[0].id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_another_download_reserved_is_refused() {
+    let server = serve(sample_body(64 * 1024), RangeSupport::Ranges).await;
+    let manager = manager_in(&temp_dir("rename-reserved"), 1);
+    let first = start_slowly(&manager, &server).await;
+    let second = start_slowly(&manager, &server).await;
+    let reserved_by_second = manager
+        .snapshot()
+        .into_iter()
+        .find(|view| view.id == second)
+        .and_then(|view| view.target)
+        .unwrap();
+    let taken = reserved_by_second.file_name().unwrap().to_string_lossy();
+
+    let error = manager.rename_file(first, &taken).unwrap_err();
+
+    assert!(matches!(&error, RenameError::NameTaken(path) if *path == reserved_by_second));
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_only_the_case_renames_the_file() {
+    let (manager, view, _dir) = finished_download("rename-case").await;
+    let target = view.target.clone().unwrap();
+    let upper = target.file_name().unwrap().to_string_lossy().to_uppercase();
+
+    let Renamed::Now(renamed) = manager.rename_file(view.id, &upper).unwrap() else {
+        panic!("a finished file is renamed at once");
+    };
+
+    let listed: Vec<String> = std::fs::read_dir(renamed.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(listed, vec![upper]);
 }

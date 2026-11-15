@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::naming::sanitize_file_name;
 
+/// Extensions that alone say a file is a video.
+pub const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mkv", "webm", "avi", "mov", "wmv", "flv", "m4v", "mpg", "mpeg", "3gp",
+];
+/// MPEG transport streams share `.ts` with TypeScript source. The Video
+/// category still files them by default, but the extension proves nothing.
+const AMBIGUOUS_VIDEO_EXTENSIONS: &[&str] = &["ts"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CategoryId(pub u32);
@@ -132,7 +140,9 @@ impl Default for Categories {
                     5,
                     "Video",
                     CategoryLook::Video,
-                    "mp4 mkv webm avi mov wmv flv m4v mpg mpeg 3gp ts",
+                    &[VIDEO_EXTENSIONS, AMBIGUOUS_VIDEO_EXTENSIONS]
+                        .concat()
+                        .join(" "),
                 ),
                 other(),
             ],

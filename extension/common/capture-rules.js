@@ -12,8 +12,15 @@ const DownpourRules = (() => {
     minSizeKb: 0,
     excludedSites: "",
     videoButton: true,
+    // Videos a server on this computer plays (a media server, a page under
+    // development) are watched, not downloaded.
+    captureLocalVideos: false,
     handOffNotice: true,
   });
+
+  // What counts as a video for `captureLocalVideos`: video files and the
+  // playlists of video streams.
+  const VIDEO_EXTENSIONS = Object.freeze(["avi", "flv", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "webm", "wmv", "m3u8", "mpd"]);
 
   // Media smaller than this is usually a preview, ad, or adaptive-stream segment.
   const MIN_MEDIA_BYTES = 512 * 1024;
@@ -86,6 +93,9 @@ const DownpourRules = (() => {
     }
     const name = download.fileName || fileNameFromUrl(download.url);
     const extension = fileExtension(name);
+    if (!options.captureLocalVideos && isLocalAddress(url.href) && VIDEO_EXTENSIONS.includes(extension)) {
+      return { capture: false, reason: "videos from this computer stay in the browser" };
+    }
     if (!parseList(options.fileTypes).includes(extension)) {
       return { capture: false, reason: extension ? `.${extension} is not a captured type` : "no file extension" };
     }
@@ -415,6 +425,55 @@ const DownpourRules = (() => {
     };
   }
 
+  /**
+   * How often a tab's refused playlist may be read again: at most `limit`
+   * times per address, `gapMs` apart. A tab's count starts over when it
+   * shows a new page.
+   * @param {{limit: number, gapMs: number, clock: () => number}} policy
+   */
+  function createRereadBudget(policy) {
+    const tabs = new Map(); // tab id -> Map(address -> {count, at})
+    return {
+      /** Whether the playlist may be read now; counts the read when it may. */
+      take(tabId, url) {
+        const reads = tabs.get(tabId) ?? new Map();
+        tabs.set(tabId, reads);
+        const now = policy.clock();
+        const last = reads.get(url) ?? { count: 0, at: -Infinity };
+        if (last.count >= policy.limit || now - last.at < policy.gapMs) {
+          return false;
+        }
+        reads.set(url, { count: last.count + 1, at: now });
+        return true;
+      },
+      forget(tabId) {
+        tabs.delete(tabId);
+      },
+    };
+  }
+
+  /**
+   * Playlists read for videos that play them directly, so are not in the
+   * tab's list; kept per tab until it shows a new page.
+   */
+  function createPlaylistMemo() {
+    const tabs = new Map(); // tab id -> Map(address -> playlist)
+    return {
+      remember(tabId, url, playlist) {
+        const playlists = tabs.get(tabId) ?? new Map();
+        tabs.set(tabId, playlists);
+        playlists.set(url, playlist);
+      },
+      /** The playlist read for the address, or undefined. */
+      recall(tabId, url) {
+        return tabs.get(tabId)?.get(url);
+      },
+      forget(tabId) {
+        tabs.delete(tabId);
+      },
+    };
+  }
+
   /** Whether `url` is listed in a tab's media, as an entry or a stream's variant. */
   function isListedMedia(list, url) {
     return list.some((entry) => entry.url === url || entry.variantUrls?.includes(url));
@@ -436,6 +495,46 @@ const DownpourRules = (() => {
     const variants = entry.variantUrls ?? [];
     const others = list.filter((known) => !variants.includes(known.url));
     return [entry, ...others].slice(0, limit);
+  }
+
+  /**
+   * A tab's media list after the stream at `url` was read again, or null when
+   * the stream is gone or the read found nothing new. The playlist's
+   * variants are hidden as on detection.
+   * @param {Array} list the tab's media, newest first
+   * @param {string} url the stream's address
+   * @param {{kind: string, heights: number[], variantUrls: string[]}} playlist from `describePlaylist`
+   */
+  function withPlaylistRead(list, url, playlist) {
+    const stream = list.find((entry) => entry.kind === "stream" && entry.url === url);
+    if (!stream) {
+      return null;
+    }
+    const unchanged = stream.playlistKind === playlist.kind && String(stream.heights) === String(playlist.heights);
+    if (unchanged) {
+      return null;
+    }
+    const variantUrls = playlist.kind === "multivariant" ? playlist.variantUrls : [];
+    const updated = { ...stream, playlistKind: playlist.kind, heights: playlist.heights, variantUrls };
+    return list
+      .filter((entry) => !variantUrls.includes(entry.url))
+      .map((entry) => (entry === stream ? updated : entry));
+  }
+
+  /**
+   * Request headers for our own read of a page's playlist: the Referer and
+   * Origin the page sent replace ours, because video CDNs often refuse
+   * requests without them.
+   * @param {Array<{name: string, value: string}>} headers what Firefox would send
+   * @param {{sentReferer?: string, origin?: string}} page what the page sent
+   */
+  function withPageHeaders(headers, page) {
+    const pageHeaders = [
+      { name: "Referer", value: page.sentReferer },
+      { name: "Origin", value: page.origin },
+    ].filter((header) => header.value);
+    const overridden = new Set(pageHeaders.map((header) => header.name.toLowerCase()));
+    return [...(headers ?? []).filter((header) => !overridden.has(header.name.toLowerCase())), ...pageHeaders];
   }
 
   /**
@@ -547,6 +646,79 @@ const DownpourRules = (() => {
   }
 
   /**
+   * The page a download was started from. Many sites send only their origin
+   * as the Referer (the "strict-origin" referrer policies), which loses the
+   * page; the tab that started the download still shows it. A full Referer
+   * wins, since the tab may have moved on, and the tab counts only while it
+   * shows the Referer's site, so an unrelated page is never recorded.
+   */
+  function downloadPage(referrer, tabPage) {
+    const sent = parseHttpUrl(referrer);
+    if (!sent) return undefined;
+    const sentOnlyTheSite = sent.pathname === "/" && !sent.search;
+    const shown = parseHttpUrl(tabPage);
+    if (sentOnlyTheSite && shown && shown.origin === sent.origin) return shown.href;
+    return sent.href;
+  }
+
+  /** The title to name a video found on a page after, or undefined when it has none. */
+  function videoTitle(title) {
+    const trimmed = String(title ?? "").trim();
+    return trimmed || undefined;
+  }
+
+  /**
+   * The title of the page that started a download, from `tab`: it counts
+   * only while the tab shows the Referer's site. A link opened in a new tab
+   * would otherwise name the video "New Tab".
+   */
+  function startingPageTitle(tab, referrer) {
+    return sameOrigin(tab?.url, referrer) ? videoTitle(tab.title) : undefined;
+  }
+
+  /** Whether a media response is a video; audio is not what the video settings are about. */
+  function isVideoMime(mime) {
+    return String(mime ?? "").toLowerCase().startsWith("video/");
+  }
+
+  /**
+   * The title to name a link from a page after. A page lists many links
+   * (episodes, parts), so its title names only a linked stream, whose own
+   * name (`master.m3u8`) says nothing; a linked file keeps its name.
+   */
+  function linkTitle(linkUrl, title) {
+    return streamFormatOf(linkUrl, []) ? videoTitle(title) : undefined;
+  }
+
+  /**
+   * Whether `text` is an address of this computer: localhost (and its
+   * subdomains), the 127.0.0.0/8 loopback range, ::1, or 0.0.0.0. The URL
+   * parser has already written short forms such as 127.1 out in full.
+   */
+  function isLocalAddress(text) {
+    const url = parseHttpUrl(text);
+    if (!url) return false;
+    const host = url.hostname.toLowerCase();
+    return (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      /^127\.\d+\.\d+\.\d+$/.test(host) ||
+      host === "[::1]" ||
+      host === "0.0.0.0"
+    );
+  }
+
+  /**
+   * Whether a video found on `pageUrl` at `videoUrl` is left alone: it comes
+   * from, or plays on, this computer and the settings keep such videos in
+   * the browser.
+   */
+  function isIgnoredLocalVideo(videoUrl, pageUrl, settings) {
+    if ({ ...DEFAULT_SETTINGS, ...settings }.captureLocalVideos) return false;
+    return isLocalAddress(videoUrl) || isLocalAddress(pageUrl);
+  }
+
+  /**
    * What the on-video Download button sends for a <video>. A plain media
    * address is used as is. Streaming players play from a blob: address, so
    * the stream detected in the tab is used instead, preferring one the same
@@ -563,8 +735,50 @@ const DownpourRules = (() => {
       if (known) return known;
       return format ? { kind: "stream", format, url: src } : { kind: "file", url: src, fileName: fileNameFromUrl(src) };
     }
+    const candidates = frameStreams(entries, video.frameId);
+    // A player that switches quality loads another one-quality playlist
+    // after the multivariant one; the one listing the qualities is the download.
+    return candidates.find(listsQualities) ?? candidates[0] ?? null;
+  }
+
+  /** The tab's streams from the frame, or all of them when the frame has none; newest first. */
+  function frameStreams(entries, frameId) {
     const streams = (entries ?? []).filter((entry) => entry.kind === "stream");
-    return streams.find((entry) => entry.frameId === video.frameId) ?? streams[0] ?? null;
+    const inFrame = streams.filter((entry) => entry.frameId === frameId);
+    return inFrame.length > 0 ? inFrame : streams;
+  }
+
+  function listsQualities(entry) {
+    return entry.heights?.length > 0;
+  }
+
+  /** A stream whose playlist was never read (a video whose address is it) or whose read failed. */
+  function needsPlaylistRead(entry) {
+    return entry?.kind === "stream" && (entry.playlistKind === undefined || entry.playlistKind === "unknown");
+  }
+
+  /**
+   * The stream of the frame whose playlist should be read again, or null.
+   * When the server refused the multivariant playlist, its variants were
+   * not hidden and are listed after it; the player loads the multivariant
+   * first, so the oldest unread stream is the one that lists the qualities.
+   */
+  function streamToReread(entries, frameId) {
+    const candidates = frameStreams(entries, frameId);
+    if (candidates.some(listsQualities)) {
+      return null;
+    }
+    return candidates.findLast(needsPlaylistRead) ?? null;
+  }
+
+  /** Whether `source` was seen loading in the frame, not just guessed from a video's address. */
+  function isDetectedInFrame(entries, source, frameId) {
+    return Boolean(source) && (entries ?? []).some((entry) => entry.url === source.url && entry.frameId === frameId);
+  }
+
+  /** The frame's address as a referrer, or the page's when the frame has none of its own (about:blank). */
+  function frameReferrer(frameUrl, pageUrl) {
+    return /^https?:/i.test(frameUrl ?? "") ? frameUrl : pageUrl;
   }
 
   /** "1080p, 720p, 480p" for the popup; empty when unknown. */
@@ -623,7 +837,95 @@ const DownpourRules = (() => {
     return unit === 0 ? `${bytes} B` : `${value >= 100 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
   }
 
+  // ---- The on-video button's placement and pinning ----
+  // video-button.js reads the page and moves the button; these decide.
+
+  // Smaller videos are previews, ads, or thumbnails.
+  const MIN_VIDEO_BUTTON_WIDTH = 200;
+  const MIN_VIDEO_BUTTON_HEIGHT = 120;
+
+  /** Whether a box is large enough to be a video worth a button. */
+  function isLargeBox(rect) {
+    return rect.width >= MIN_VIDEO_BUTTON_WIDTH && rect.height >= MIN_VIDEO_BUTTON_HEIGHT;
+  }
+
+  /**
+   * Which box the button sits in, given the video's box and the boxes of the
+   * elements around it, nearest first: the video itself (-1), the index of
+   * the surrounding box to use, or null. A video the player keeps hidden (no
+   * size at all) until it plays takes the player's box around it; a small
+   * video is a preview or a thumbnail and gets none.
+   */
+  function videoBoxChoice(videoRect, surroundingRects) {
+    if (isLargeBox(videoRect)) return -1;
+    if (videoRect.width > 0 && videoRect.height > 0) return null;
+    const index = surroundingRects.findIndex(isLargeBox);
+    return index === -1 ? null : index;
+  }
+
+  /** The index of the largest box, or -1 when there is none; the first wins a tie. */
+  function largestBox(rects) {
+    let largest = -1;
+    let largestArea = 0;
+    rects.forEach((rect, index) => {
+      const area = rect.width * rect.height;
+      if (area > largestArea) {
+        largest = index;
+        largestArea = area;
+      }
+    });
+    return largest;
+  }
+
+  /**
+   * Where the button goes: the video's top-right corner, kept inside the
+   * visible width, so a video wider than the window or cut off on the right
+   * neither hides the button nor widens the page. `rect` is in window
+   * coordinates; `scroll` turns them into page coordinates (zero in
+   * fullscreen, where the button is fixed to the screen).
+   * @returns {{left: number, top: number}}
+   */
+  function videoButtonPosition(rect, { width, visibleWidth, scroll, gap }) {
+    const right = Math.min(rect.right, visibleWidth);
+    const insideVideo = Math.max(rect.left, right - width - gap);
+    const left = Math.max(gap, Math.min(insideVideo, visibleWidth - width - gap));
+    return { left: left + scroll.x, top: rect.top + gap + scroll.y };
+  }
+
+  /**
+   * Whether the button hides after the pointer leaves its video. It stays
+   * while its menu is open, and on the frame's main video, except in
+   * fullscreen, where it hides like the player's own controls.
+   */
+  function videoButtonHidesWhenLeft({ menuOpen, onMainVideo, fullscreen }) {
+    if (menuOpen) return false;
+    return !onMainVideo || fullscreen;
+  }
+
+  /** Whether the button goes back to the main video after leaving `another` video. */
+  function videoButtonReturnsToMain({ leftMainVideo, fullscreen }) {
+    return !leftMainVideo && !fullscreen;
+  }
+
+  /**
+   * What the button does when fullscreen starts or ends.
+   * @returns {"hide-later" | "stay" | "show-main" | "nothing"}
+   */
+  function videoButtonOnFullscreen({ fullscreen, showing, onMainVideo }) {
+    if (fullscreen) return "hide-later";
+    if (showing && onMainVideo) return "stay";
+    if (!showing) return "show-main";
+    return "nothing";
+  }
+
   return {
+    isLargeBox,
+    videoBoxChoice,
+    largestBox,
+    videoButtonPosition,
+    videoButtonHidesWhenLeft,
+    videoButtonReturnsToMain,
+    videoButtonOnFullscreen,
     DEFAULT_SETTINGS,
     parseList,
     fileNameFromUrl,
@@ -643,15 +945,30 @@ const DownpourRules = (() => {
     parseQuality,
     videoQualityChoices,
     pickVideoSource,
+    needsPlaylistRead,
+    streamToReread,
+    isDetectedInFrame,
+    frameReferrer,
     REFUSAL_FALLBACK,
     handOffNotice,
     sameOrigin,
+    downloadPage,
+    videoTitle,
+    startingPageTitle,
+    isVideoMime,
+    linkTitle,
+    isLocalAddress,
+    isIgnoredLocalVideo,
     parseDownloadUrl,
     isDefaultCookieStore,
     browserFallbackDownload,
     createBypassList,
+    createRereadBudget,
+    createPlaylistMemo,
     isListedMedia,
     withDetectedMedia,
+    withPlaylistRead,
+    withPageHeaders,
     createTabMediaLedger,
     formatBytes,
   };

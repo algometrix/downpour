@@ -5,7 +5,7 @@ use super::icons::{brand_mark, Icon};
 use super::theme::{ControlShape, NavInk};
 use super::widgets::{
     elided, icon_button_at, nav_item, section_label, section_label_with_action, toggle_switch_at,
-    NavEntry, NAV_ITEM_HEIGHT,
+    trailing_icon_box, NavEntry, ICON_BUTTON_MARGIN, NAV_ITEM_HEIGHT, SIDEBAR_INSET,
 };
 use super::{format, hotkeys, theme, Action, Catalog, Filter, Page};
 use crate::app_settings::{AppSettings, Appearance, NewDownloadMode};
@@ -23,6 +23,7 @@ const SPEED_BADGE_SIZE: f32 = 32.0;
 const SPEED_CARD_RADIUS: u8 = 14;
 const SPEED_BADGE_RADIUS: u8 = 9;
 const SWITCH_SIZE: egui::Vec2 = vec2(36.0, 20.0);
+const THEME_TOGGLE_SIZE: f32 = 32.0;
 
 pub struct SidebarState<'a> {
     pub downloads: &'a [DownloadView],
@@ -238,7 +239,7 @@ fn auto_start_card(ui: &mut Ui, mode: NewDownloadMode, actions: &mut Vec<Action>
         ink.panel_fill,
         None,
     );
-    let inner = rect.shrink2(vec2(12.0, 9.0));
+    let inner = rect.shrink2(vec2(SIDEBAR_INSET, 9.0));
     let on = mode == NewDownloadMode::StartRightAway;
     let switch_rect = Rect::from_min_size(
         pos2(
@@ -302,7 +303,10 @@ fn speed_card(
         None,
     );
     let badge = Rect::from_center_size(
-        pos2(rect.left() + 12.0 + SPEED_BADGE_SIZE / 2.0, rect.center().y),
+        pos2(
+            rect.left() + SIDEBAR_INSET + SPEED_BADGE_SIZE / 2.0,
+            rect.center().y,
+        ),
         vec2(SPEED_BADGE_SIZE, SPEED_BADGE_SIZE),
     );
     // The surface with the primary color on it reads on every sidebar fill.
@@ -314,7 +318,7 @@ fn speed_card(
     Icon::Bolt.paint(painter, badge.shrink(8.0), theme::primary());
 
     let text_left = badge.right() + 10.0;
-    let text_width = rect.right() - 12.0 - text_left;
+    let text_width = rect.right() - SIDEBAR_INSET - text_left;
     let value = elided(
         ui,
         format::speed(total),
@@ -349,7 +353,7 @@ fn settings_row(ui: &mut Ui, actions: &mut Vec<Action>) {
     let ink = theme::sidebar_ink();
     let (row, _) =
         ui.allocate_exact_size(vec2(ui.available_width(), NAV_ITEM_HEIGHT), Sense::hover());
-    let toggle = Rect::from_center_size(pos2(row.right() - 19.0, row.center().y), vec2(32.0, 32.0));
+    let toggle = trailing_icon_box(row, THEME_TOGGLE_SIZE, ICON_BUTTON_MARGIN);
     let settings = Rect::from_min_max(row.min, pos2(toggle.left() - 6.0, row.bottom()));
     ui.scope_builder(egui::UiBuilder::new().max_rect(settings), |ui| {
         let entry = NavEntry {

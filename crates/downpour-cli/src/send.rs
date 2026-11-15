@@ -32,7 +32,8 @@ pub fn run(args: &SendArgs, urls: Vec<Url>) -> Result<usize, SendError> {
         .into_iter()
         .map(|url| BrowserDownload {
             url: url.to_string(),
-            file_name: args.file_name.clone(),
+            file_name: None,
+            typed_name: args.file_name.clone(),
             referrer: args.referer.clone(),
             cookies: None,
             user_agent: None,
@@ -42,6 +43,7 @@ pub fn run(args: &SendArgs, urls: Vec<Url>) -> Result<usize, SendError> {
             stream: None,
             quality: None,
             title: None,
+            video_title: None,
             page_url: args.referer.clone(),
             origin: None,
             accept_language: None,

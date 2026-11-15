@@ -8,8 +8,10 @@ use reqwest::header::{self, HeaderValue};
 use reqwest::{Client, StatusCode};
 use url::Url;
 
-use crate::http::{describe_status, parse_content_range, RequestContext, TransferError};
-use crate::naming::{file_name_from_content_disposition, FileName, FileNameSource};
+use crate::http::{
+    content_disposition_text, describe_status, parse_content_range, RequestContext, TransferError,
+};
+use crate::naming::{file_name_from_content_disposition, FileName};
 
 /// Links checked at the same time; servers throttle bursts.
 const CHECK_CONCURRENCY: usize = 4;
@@ -138,10 +140,11 @@ async fn check(client: &Client, url: &Url, context: &RequestContext) -> LinkStat
             .and_then(|range| range.total),
         _ => response.content_length(),
     };
-    let name = text(header::CONTENT_DISPOSITION)
+    // A blank name (`filename=""`) is no name: the address names the file then.
+    let name = content_disposition_text(response.headers())
         .as_deref()
         .and_then(file_name_from_content_disposition)
-        .map(|name| FileName::new(&name, FileNameSource::Server))
+        .and_then(|name| FileName::from_server(&name))
         .unwrap_or_else(|| FileName::guess_from_url(response.url()));
     LinkStatus::Online { name, size }
 }

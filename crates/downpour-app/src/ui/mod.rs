@@ -13,7 +13,7 @@ mod link_grabber;
 mod list;
 mod live_speed;
 #[cfg(debug_assertions)]
-mod screenshot;
+pub mod screenshot;
 mod sidebar;
 mod stats;
 mod theme;
@@ -28,27 +28,33 @@ use std::time::Duration;
 use downpour_core::limiter::DownloadLimit;
 use downpour_core::{
     Categories, CategoryId, DownloadId, DownloadManager, DownloadStatus, DownloadView,
-    ManagerError, Queue, QueueId, QueuePlace, QueueState, RemoveFiles, Store,
+    ManagerError, Queue, QueueId, QueuePlace, QueueState, RemoveFiles, Renamed, Store,
 };
 use eframe::egui;
 use url::Url;
 
 use crate::app_settings::{
-    AppSettings, Appearance, CloseAction, MinimizeAction, NewDownloadMode, WindowSize,
+    AppSettings, Appearance, CloseAction, ListOrder, MinimizeAction, NewDownloadMode, SortColumn,
+    TrayNotice, WindowSize,
 };
 use crate::browser_link::BrowserLink;
-use crate::desktop::{Announcement, Desktop, DesktopStart, Outcome, TitleBarColors};
+use crate::desktop::{Announcement, Desktop, DesktopStart, Outcome, PendingNotice, TitleBarColors};
 use crate::duplicates::Arrival;
 use crate::inbox::{handling_for, BrowserHandling, Delivery, Inbox, IncomingRequest, WindowEffect};
 use crate::platform;
 use crate::tray::{QuitRequest, Tray, WindowStart};
 use dialogs::{
     AddUrlForm, BrowserForm, CategoriesForm, Dialog, DialogCommand, DuplicateForm, QueueForm,
-    RefreshForm, RemoveForm, SettingsForm,
+    RefreshForm, RemoveForm, RenameFileForm, SettingsForm,
 };
 use theme::Placement;
 use toasts::{ToastKind, Toasts};
 
+/// Shown once, the first time the user sends the window to the tray.
+const TRAY_NOTICE_TITLE: &str = "Downpour is still running";
+/// How often the answer to the tray notice is looked for while it is due.
+const TRAY_NOTICE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const TRAY_NOTICE_BODY: &str = "Downloads keep going in the notification area. Click the Downpour icon there to open it, or right-click it to quit.";
 const ACTIVE_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
 const SIDEBAR_WIDTH: f32 = 248.0;
 const DETAILS_WIDTH: f32 = 320.0;
@@ -151,6 +157,7 @@ pub enum Action {
     SetSpeedLimit(DownloadId, DownloadLimit),
     Restart(DownloadId),
     AskRemove(DownloadId),
+    AskRename(DownloadId),
     /// Drop finished downloads from the list; their files and history stay.
     ClearCompleted,
     OpenFile(PathBuf),
@@ -178,6 +185,10 @@ pub enum Action {
     /// Wait for the browser to send a fresh address for this download.
     RefreshAddress(DownloadId),
     CopyText(String),
+    /// Sort the list by this column, or change or end the sort by it.
+    SortBy(SortColumn),
+    /// A choice in the Sort menu.
+    SetListOrder(ListOrder),
 }
 
 pub struct App {
@@ -211,6 +222,8 @@ pub struct App {
     start: WindowStart,
     /// Notifications, taskbar progress, sleep, and title bar colors.
     desktop: Desktop,
+    /// The tray notice handed to Windows, until Windows answers.
+    tray_notice: Option<PendingNotice>,
     #[cfg(debug_assertions)]
     screenshot: Option<screenshot::ScreenshotHook>,
     /// `None` if the sampling thread could not start; the graph then stays empty.
@@ -311,6 +324,7 @@ impl App {
             was_minimized: None,
             start,
             desktop,
+            tray_notice: None,
             #[cfg(debug_assertions)]
             screenshot: screenshot::ScreenshotHook::from_env(),
             speed_sampler,
@@ -468,6 +482,22 @@ impl App {
                         completed,
                     )));
                 }
+                Ok(())
+            }
+            Action::AskRename(id) => {
+                if let Some(download) = downloads.iter().find(|download| download.id == id) {
+                    self.dialog = Some(Dialog::RenameFile(RenameFileForm::for_download(download)));
+                }
+                Ok(())
+            }
+            Action::SortBy(column) => {
+                self.settings.list_order = self.settings.list_order.after_click(column);
+                self.save_settings();
+                Ok(())
+            }
+            Action::SetListOrder(order) => {
+                self.settings.list_order = order;
+                self.save_settings();
                 Ok(())
             }
             Action::OpenFile(path) => {
@@ -816,6 +846,29 @@ impl App {
                     }
                 }
             }
+            DialogCommand::RenameFile { id, name } => match self.manager.rename_file(id, &name) {
+                Ok(Renamed::Now(renamed)) => {
+                    self.dialog = None;
+                    let shown = renamed
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.toasts.push(ToastKind::Success, "File renamed", shown);
+                }
+                Ok(Renamed::WhenFinished(name)) => {
+                    self.dialog = None;
+                    self.toasts.push(
+                        ToastKind::Success,
+                        "Name saved",
+                        format!("The file is saved as {name} when the download finishes"),
+                    );
+                }
+                Err(error) => {
+                    if let Some(Dialog::RenameFile(form)) = &mut self.dialog {
+                        form.error = Some(error.to_string());
+                    }
+                }
+            },
             DialogCommand::RegisterBrowserIntegration => {
                 let result = register_browser_integration();
                 if let Some(Dialog::Settings(form)) = &mut self.dialog {
@@ -956,8 +1009,10 @@ impl App {
         if close_requested && self.settings.on_close == CloseAction::HideToTray {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.hide_to_tray(ctx);
+            self.tell_once_about_the_tray();
         } else if just_minimized && self.settings.on_minimize == MinimizeAction::HideToTray {
             self.hide_to_tray(ctx);
+            self.tell_once_about_the_tray();
         } else if !minimized && !close_requested {
             self.window = WindowPlace::Shown;
         }
@@ -1020,7 +1075,12 @@ impl App {
             return Vec::new();
         }
         let on_list = self.page == Page::Downloads;
-        let visible = list::visible_downloads(downloads, self.filter, &self.search);
+        let visible = list::visible_downloads(
+            downloads,
+            self.filter,
+            &self.search,
+            self.settings.list_order,
+        );
         let selected = self
             .selected
             .filter(|_| on_list)
@@ -1068,9 +1128,8 @@ impl App {
                     .and_then(list::primary_row_action)
                     .map(|(_, _, action)| action),
                 Command::OpenFile => selected
-                    .filter(completed)
-                    .and_then(|download| download.target.clone())
-                    .map(Action::OpenFile),
+                    .and_then(DownloadView::finished_file)
+                    .map(|file| Action::OpenFile(file.to_path_buf())),
                 Command::ShowInFolder => {
                     selected.map(|download| Action::Reveal(list::location(download)))
                 }
@@ -1078,6 +1137,7 @@ impl App {
                     selected.map(|download| Action::CopyText(download.url.to_string()))
                 }
                 Command::Remove => selected.map(|download| Action::AskRemove(download.id)),
+                Command::Rename => selected.map(|download| Action::AskRename(download.id)),
                 Command::MoveUp | Command::MoveDown => {
                     let step = match command {
                         Command::MoveUp => list::Step::Previous,
@@ -1133,6 +1193,44 @@ impl App {
         tracing::info!("window hidden to the tray");
     }
 
+    /// The first time the user sends the window to the tray, says where
+    /// Downpour went: someone new would think closing the window quit it. A
+    /// start at sign-in does not count; that user chose the tray.
+    fn tell_once_about_the_tray(&mut self) {
+        if self.settings.tray_notice == TrayNotice::Shown || self.tray_notice.is_some() {
+            return;
+        }
+        match self.desktop.tell(TRAY_NOTICE_TITLE, TRAY_NOTICE_BODY) {
+            Ok(pending) => self.tray_notice = Some(pending),
+            Err(error) => {
+                tracing::warn!(%error, "the tray notice was not shown; trying again next time")
+            }
+        }
+    }
+
+    /// Takes Windows' answer to the tray notice: only a notice it showed
+    /// counts as shown, so a failed one is tried again next time.
+    fn follow_tray_notice(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.tray_notice else {
+            return;
+        };
+        let Some(outcome) = pending.outcome() else {
+            ctx.request_repaint_after(TRAY_NOTICE_POLL_INTERVAL);
+            return;
+        };
+        self.tray_notice = None;
+        match outcome {
+            Ok(()) => {
+                if self.settings.mark_tray_notice_shown() {
+                    self.save_settings();
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the tray notice was not shown; trying again next time")
+            }
+        }
+    }
+
     /// Started at sign-in, the window goes to the tray as soon as eframe has
     /// shown it (after the first frame; before that, eframe's own showing
     /// would bring it back).
@@ -1185,6 +1283,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_window_events(ctx);
         self.finish_start_in_tray(ctx);
+        self.follow_tray_notice(ctx);
         // Follows a settings change, or Windows switching between light and dark.
         let look = self.shown_look(ctx);
         if look != theme::look() {
@@ -1306,6 +1405,7 @@ impl eframe::App for App {
                         filter: self.filter,
                         search: &mut self.search,
                         selected: self.selected,
+                        order: self.settings.list_order,
                     };
                     list::show(ui, state, &mut actions);
                 }
