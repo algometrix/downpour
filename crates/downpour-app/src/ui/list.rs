@@ -60,6 +60,8 @@ pub struct ListState<'a> {
     /// The downloads shown for this view and search, in list order; the
     /// app works them out once a frame.
     pub visible: &'a [&'a DownloadView],
+    /// A row a key just moved to, scrolled into view this frame.
+    pub reveal: Option<DownloadId>,
 }
 
 pub fn show(ui: &mut Ui, state: ListState<'_>, actions: &mut Vec<Action>) {
@@ -128,6 +130,7 @@ fn download_rows<'a>(
         visible,
         selection: state.selection,
         shown: &shown,
+        reveal: state.reveal,
     };
     // A queue view shows the start order, so its rows can be dragged and
     // moved; other views are filtered lists.
@@ -150,6 +153,20 @@ fn download_rows<'a>(
             ui.add_space(geometry.edge_room());
         });
     dragged_badge(ui.ctx(), in_queue);
+}
+
+/// Copies the shown picks' addresses: one, or each on its own line.
+pub fn copy_addresses(shown: &Shown<'_>) -> Option<Action> {
+    match shown {
+        Shown::Nothing => None,
+        Shown::One(download) => Some(Action::CopyText(download.url.to_string())),
+        Shown::Group(group) => Some(Action::CopyAddresses(
+            group
+                .iter()
+                .map(|download| download.url.to_string())
+                .collect(),
+        )),
+    }
 }
 
 /// What a dragged row carries: the downloads it moves, in list order.
@@ -960,6 +977,7 @@ struct RowList<'a> {
     selection: &'a Selection,
     /// The picks among `visible`.
     shown: &'a Shown<'a>,
+    reveal: Option<DownloadId>,
 }
 
 impl<'a> RowList<'a> {
@@ -1099,6 +1117,9 @@ fn row<'a>(
         vec2(ui.available_width(), geometry.slot_height()),
         Sense::click_and_drag(),
     );
+    if list.reveal == Some(download.id) {
+        response.scroll_to_me(None);
+    }
     if !ui.is_rect_visible(slot) {
         return;
     }
@@ -1586,16 +1607,12 @@ fn group_menu(
     ui.separator();
     single_file_item(ui, "Open download page");
     single_file_item(ui, "Refresh download address…");
-    let addresses = group
-        .iter()
-        .map(|download| download.url.to_string())
-        .collect();
     group_item(
         ui,
         actions,
         GroupItem {
-            label: "Copy addresses",
-            does: vec![Action::CopyAddresses(addresses)],
+            label: &hotkeys::COPY_ADDRESS.label("Copy addresses"),
+            does: copy_addresses(list.shown).into_iter().collect(),
             off_because: None,
         },
     );

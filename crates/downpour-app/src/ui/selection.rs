@@ -1,6 +1,6 @@
 //! Which downloads are picked in the list. A plain click picks one,
-//! Shift+click picks the run from the last plain or Ctrl click, and
-//! Ctrl+click adds or drops one, as in a file browser.
+//! Shift+click picks the run from the last plain or Ctrl click, Ctrl+click
+//! adds or drops one, and Ctrl+Shift+click adds a run, as in a file browser.
 
 use std::collections::HashSet;
 
@@ -15,17 +15,18 @@ pub enum Pick {
     Range,
     /// Add this download, or drop it if it was picked (Ctrl).
     Toggle,
+    /// Add the run from the anchor to this one, keeping the rest (Ctrl+Shift).
+    AddRange,
 }
 
 impl Pick {
-    /// The pick a click with these keys held makes. Shift wins over Ctrl.
+    /// The pick a click with these keys held makes.
     pub fn from_modifiers(modifiers: eframe::egui::Modifiers) -> Pick {
-        if modifiers.shift {
-            Pick::Range
-        } else if modifiers.command {
-            Pick::Toggle
-        } else {
-            Pick::Only
+        match (modifiers.shift, modifiers.command) {
+            (true, true) => Pick::AddRange,
+            (true, false) => Pick::Range,
+            (false, true) => Pick::Toggle,
+            (false, false) => Pick::Only,
         }
     }
 }
@@ -94,22 +95,53 @@ impl Selection {
                 self.anchor = Some(id);
                 self.focus = Some(id);
             }
-            Pick::Range => {
-                let from = self
-                    .anchor
-                    .and_then(|anchor| visible.iter().position(|shown| *shown == anchor));
-                let to = visible.iter().position(|shown| *shown == id);
-                // With no anchor in view there is no run to pick: start one here.
-                let (Some(from), Some(to)) = (from, to) else {
-                    *self = Selection::only(id);
-                    return;
-                };
-                let run = if from <= to { from..=to } else { to..=from };
+            Pick::Range => match self.run_to(id, visible) {
                 // The anchor stays, so the next Shift+click redraws the run.
-                self.picked = visible[run].iter().copied().collect();
-                self.focus = Some(id);
-            }
+                Some(run) => {
+                    self.picked = run.iter().copied().collect();
+                    self.focus = Some(id);
+                }
+                // With no anchor in view there is no run to pick: start one here.
+                None => *self = Selection::only(id),
+            },
+            Pick::AddRange => match self.run_to(id, visible) {
+                Some(run) => {
+                    self.picked.extend(run.iter().copied());
+                    self.focus = Some(id);
+                }
+                None => {
+                    self.picked.insert(id);
+                    self.anchor = Some(id);
+                    self.focus = Some(id);
+                }
+            },
         }
+    }
+
+    /// The rows from the anchor to `id` in `visible`, either way; `None`
+    /// when either is not shown.
+    fn run_to<'v>(&self, id: DownloadId, visible: &'v [DownloadId]) -> Option<&'v [DownloadId]> {
+        let from = visible
+            .iter()
+            .position(|shown| Some(*shown) == self.anchor)?;
+        let to = visible.iter().position(|shown| *shown == id)?;
+        Some(if from <= to {
+            &visible[from..=to]
+        } else {
+            &visible[to..=from]
+        })
+    }
+
+    /// Picks every row in `visible`, as Ctrl+A does. The anchor and focus
+    /// stay if shown; otherwise both start on the first row.
+    pub fn select_all(&mut self, visible: &[DownloadId]) {
+        let in_view = |id: &DownloadId| visible.contains(id);
+        self.picked = visible.iter().copied().collect();
+        self.focus = self
+            .focus
+            .filter(in_view)
+            .or_else(|| visible.first().copied());
+        self.anchor = self.anchor.filter(in_view).or(self.focus);
     }
 
     pub fn contains(&self, id: DownloadId) -> bool {
@@ -227,6 +259,43 @@ mod tests {
         let one_shown = selection.shown(&[&two, &three]).one();
         assert_eq!(one_shown.map(|download| download.id), Some(DownloadId(3)));
         assert!(matches!(selection.shown(&[&two]), Shown::Nothing));
+    }
+
+    #[test]
+    fn ctrl_shift_adds_a_run_and_keeps_the_rest() {
+        let list = ids(&[1, 2, 3, 4, 5, 6]);
+        let mut selection = Selection::only(DownloadId(1));
+        selection.pick(DownloadId(4), Pick::Toggle, &list);
+        selection.pick(DownloadId(6), Pick::AddRange, &list);
+        assert_eq!(picked(&selection), [1, 4, 5, 6]);
+        assert_eq!(selection.focus(), Some(DownloadId(6)));
+    }
+
+    #[test]
+    fn select_all_picks_every_shown_row_and_keeps_the_focus() {
+        let list = ids(&[1, 2, 3]);
+        let mut selection = Selection::only(DownloadId(2));
+        selection.select_all(&list);
+        assert_eq!(picked(&selection), [1, 2, 3]);
+        assert_eq!(selection.focus(), Some(DownloadId(2)));
+        // With nothing picked before, the focus starts on the first row.
+        let mut fresh = Selection::default();
+        fresh.select_all(&list);
+        assert_eq!(fresh.focus(), Some(DownloadId(1)));
+        // A Shift range afterwards runs from the focus.
+        fresh.pick(DownloadId(2), Pick::Range, &list);
+        assert_eq!(picked(&fresh), [1, 2]);
+    }
+
+    #[test]
+    fn select_all_keeps_the_anchor_of_a_shift_run() {
+        let list = ids(&[1, 2, 3, 4, 5]);
+        let mut selection = Selection::only(DownloadId(2));
+        selection.pick(DownloadId(5), Pick::Range, &list);
+        selection.select_all(&list);
+        // Shift+Up from 5 redraws the run from 2, as in Explorer.
+        selection.pick(DownloadId(4), Pick::Range, &list);
+        assert_eq!(picked(&selection), [2, 3, 4]);
     }
 
     #[test]
