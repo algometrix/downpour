@@ -8,8 +8,9 @@ use downpour_core::settings::CONNECTION_RANGE;
 use downpour_core::stream::mux::locate_ffmpeg;
 use downpour_core::stream::{StreamError, StreamFormat, StreamOffer, VideoQuality};
 use downpour_core::{
-    Categories, Category, CategoryId, CategoryLook, DownloadId, DownloadKind, DownloadView,
-    EngineSettings, NewDownload, Queue, QueueId, RemoveFiles, RequestContext, StartMode,
+    Categories, Category, CategoryId, CategoryLook, DownloadId, DownloadKind, DownloadStatus,
+    DownloadView, EngineSettings, NewDownload, Queue, QueueId, RemoveFiles, RequestContext,
+    StartMode,
 };
 use eframe::egui::{self, vec2, Align, Key, Layout, Ui};
 use url::Url;
@@ -65,7 +66,7 @@ pub enum DialogCommand {
     /// Select the earlier download in the list and show the window.
     ShowExisting(DownloadId),
     Remove {
-        id: DownloadId,
+        ids: Vec<DownloadId>,
         files: RemoveFiles,
     },
     SaveSettings(AppSettings),
@@ -249,21 +250,64 @@ impl DuplicateForm {
     }
 }
 
+/// Asks before removing one download, or several picked together.
 pub struct RemoveForm {
-    pub id: DownloadId,
-    pub name: String,
-    pub completed: bool,
+    ids: Vec<DownloadId>,
+    /// The file name for one download, "3 downloads" for several.
+    name: String,
+    finished: Finished,
     delete_file: bool,
 }
 
-impl RemoveForm {
-    pub fn new(id: DownloadId, name: String, completed: bool) -> Self {
-        Self {
-            id,
-            name,
-            completed,
-            delete_file: false,
+/// How many of the downloads to remove finished. Finished ones have a file
+/// on disk the user may delete too; the partial data of the rest always goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Finished {
+    All,
+    Part,
+    NoneOf,
+}
+
+impl Finished {
+    fn of(downloads: &[&DownloadView]) -> Finished {
+        let done = downloads
+            .iter()
+            .filter(|download| download.status == DownloadStatus::Completed)
+            .count();
+        match done {
+            0 => Finished::NoneOf,
+            done if done == downloads.len() => Finished::All,
+            _ => Finished::Part,
         }
+    }
+
+    fn has_files(self) -> bool {
+        matches!(self, Finished::All | Finished::Part)
+    }
+
+    fn has_partial_data(self) -> bool {
+        matches!(self, Finished::Part | Finished::NoneOf)
+    }
+}
+
+impl RemoveForm {
+    /// `None` for an empty list: there is nothing to ask about.
+    pub fn for_downloads(downloads: &[&DownloadView]) -> Option<Self> {
+        let name = match downloads {
+            [] => return None,
+            [one] => one.file_name.clone(),
+            many => format!("{} downloads", many.len()),
+        };
+        Some(Self {
+            ids: downloads.iter().map(|download| download.id).collect(),
+            name,
+            finished: Finished::of(downloads),
+            delete_file: false,
+        })
+    }
+
+    fn is_group(&self) -> bool {
+        self.ids.len() > 1
     }
 }
 
@@ -1621,11 +1665,20 @@ fn duplicate(ui: &mut Ui, form: &mut DuplicateForm) -> Option<DialogCommand> {
 }
 
 fn remove(ui: &mut Ui, form: &mut RemoveForm) -> Option<DialogCommand> {
-    title(
-        ui,
-        "Remove download?",
-        "The entry will be removed from the list.",
-    );
+    let (heading, detail, delete_label) = if form.is_group() {
+        (
+            "Remove downloads?",
+            "The entries will be removed from the list.",
+            "Also delete the downloaded files from disk",
+        )
+    } else {
+        (
+            "Remove download?",
+            "The entry will be removed from the list.",
+            "Also delete the downloaded file from disk",
+        )
+    };
+    title(ui, heading, detail);
     ui.add(
         egui::Label::new(
             egui::RichText::new(&form.name)
@@ -1635,13 +1688,11 @@ fn remove(ui: &mut Ui, form: &mut RemoveForm) -> Option<DialogCommand> {
         .wrap(),
     );
     ui.add_space(8.0);
-    let delete_file_box = form.completed.then(|| {
-        ui.checkbox(
-            &mut form.delete_file,
-            "Also delete the downloaded file from disk",
-        )
-    });
-    if !form.completed {
+    let delete_file_box = form
+        .finished
+        .has_files()
+        .then(|| ui.checkbox(&mut form.delete_file, delete_label));
+    if form.finished.has_partial_data() {
         hint(ui, "Partially downloaded data will be deleted.");
     }
     let delete_file_focused = delete_file_box.is_some_and(|checkbox| checkbox.has_focus());
@@ -1672,7 +1723,10 @@ fn remove(ui: &mut Ui, form: &mut RemoveForm) -> Option<DialogCommand> {
             } else {
                 RemoveFiles::Keep
             };
-            command = Some(DialogCommand::Remove { id: form.id, files });
+            command = Some(DialogCommand::Remove {
+                ids: form.ids.clone(),
+                files,
+            });
         }
     });
     command
@@ -2217,6 +2271,7 @@ fn settings_card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixtures::view;
     use super::*;
     use downpour_core::{FileName, FileNameSource};
     use downpour_protocol::messages::{BrowserDownload, QualityPick};
@@ -2454,7 +2509,28 @@ mod tests {
     }
 
     fn pending_download() -> RemoveForm {
-        RemoveForm::new(DownloadId(1), "clip.mp4".into(), false)
+        RemoveForm::for_downloads(&[&view(1)]).unwrap()
+    }
+
+    fn finished_download() -> RemoveForm {
+        let finished = DownloadView {
+            status: downpour_core::DownloadStatus::Completed,
+            ..view(1)
+        };
+        RemoveForm::for_downloads(&[&finished]).unwrap()
+    }
+
+    #[test]
+    fn removing_a_mixed_group_offers_the_files_and_warns_about_partial_data() {
+        let finished = DownloadView {
+            status: downpour_core::DownloadStatus::Completed,
+            ..view(1)
+        };
+        let form = RemoveForm::for_downloads(&[&finished, &view(2)]).unwrap();
+        assert_eq!(form.name, "2 downloads");
+        assert_eq!(form.ids, [DownloadId(1), DownloadId(2)]);
+        assert!(form.finished.has_files() && form.finished.has_partial_data());
+        assert!(RemoveForm::for_downloads(&[]).is_none());
     }
 
     #[test]
@@ -2472,7 +2548,7 @@ mod tests {
 
     #[test]
     fn enter_honours_the_delete_file_choice() {
-        let mut form = RemoveForm::new(DownloadId(1), "clip.mp4".into(), true);
+        let mut form = finished_download();
         form.delete_file = true;
         let command = remove_dialog_after(&mut form, &[&[], &[egui::Key::Enter]]);
         assert!(matches!(
@@ -2501,7 +2577,7 @@ mod tests {
 
     #[test]
     fn enter_on_the_tabbed_to_checkbox_deletes_nothing() {
-        let mut form = RemoveForm::new(DownloadId(1), "clip.mp4".into(), true);
+        let mut form = finished_download();
         let tab: &[egui::Key] = &[egui::Key::Tab];
         let frames: [&[egui::Key]; 4] = [&[], tab, &[], &[egui::Key::Enter]];
         let command = remove_dialog_after(&mut form, &frames);

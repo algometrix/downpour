@@ -476,7 +476,7 @@ fn buttons(ui: &mut Ui, download: &DownloadView, actions: &mut Vec<Action>) {
         )
         .clicked()
         {
-            actions.push(Action::AskRemove(download.id));
+            actions.push(Action::AskRemove(vec![download.id]));
         }
     });
 }

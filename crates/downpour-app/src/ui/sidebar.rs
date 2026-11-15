@@ -2,6 +2,7 @@ use downpour_core::{DownloadView, QueueState};
 use eframe::egui::{self, pos2, vec2, Align, Color32, CornerRadius, Layout, Rect, Sense, Ui};
 
 use super::icons::{brand_mark, Icon};
+use super::list::DraggedDownloads;
 use super::theme::{ControlShape, NavInk};
 use super::widgets::{
     elided, icon_button_at, nav_item, section_label, section_label_with_action, toggle_switch_at,
@@ -106,6 +107,7 @@ fn navigation(ui: &mut Ui, state: &SidebarState<'_>, actions: &mut Vec<Action>) 
         if response.clicked() {
             actions.push(Action::SetFilter(filter));
         }
+        drop_on_queue(ui, &response, queue.id, actions);
         response.context_menu(|ui| {
             let (label, action) = match queue.state {
                 QueueState::Running => ("Stop queue", Action::StopQueue(queue.id)),
@@ -170,6 +172,27 @@ fn navigation(ui: &mut Ui, state: &SidebarState<'_>, actions: &mut Vec<Action>) 
     );
     if statistics.clicked() {
         actions.push(Action::ShowStatistics);
+    }
+}
+
+/// Downloads dragged from the list move to the queue they are dropped on;
+/// the queue is outlined while they are over it.
+fn drop_on_queue(
+    ui: &Ui,
+    response: &egui::Response,
+    queue: downpour_core::QueueId,
+    actions: &mut Vec<Action>,
+) {
+    if response.dnd_hover_payload::<DraggedDownloads>().is_some() {
+        ui.painter().rect_stroke(
+            response.rect,
+            theme::control_radius(response.rect.height()),
+            egui::Stroke::new(2.0, theme::primary()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if let Some(dragged) = response.dnd_release_payload::<DraggedDownloads>() {
+        actions.push(Action::MoveToQueue(dragged.0.clone(), queue));
     }
 }
 

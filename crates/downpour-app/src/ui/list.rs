@@ -4,13 +4,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use downpour_core::limiter::DownloadLimit;
 use downpour_core::{
-    CategoryLook, DownloadId, DownloadStatus, DownloadView, Queue, QueuePlace, QueueState,
+    CategoryLook, DownloadId, DownloadStatus, DownloadView, Queue, QueueId, QueuePlace, QueueState,
 };
 use eframe::egui::{
     self, pos2, vec2, Align, Color32, CornerRadius, Layout, Painter, Rect, Sense, Ui,
 };
 
 use super::icons::Icon;
+use super::selection::{Pick, Selection, Shown};
 use super::theme::RowStyle;
 use super::widgets::{
     self, button, button_width, dropdown, elided, galley, icon_button, icon_button_at, pill,
@@ -54,8 +55,11 @@ pub struct ListState<'a> {
     pub catalog: &'a Catalog<'a>,
     pub filter: Filter,
     pub search: &'a mut String,
-    pub selected: Option<DownloadId>,
+    pub selection: &'a Selection,
     pub order: ListOrder,
+    /// The downloads shown for this view and search, in list order; the
+    /// app works them out once a frame.
+    pub visible: &'a [&'a DownloadView],
 }
 
 pub fn show(ui: &mut Ui, state: ListState<'_>, actions: &mut Vec<Action>) {
@@ -67,7 +71,7 @@ pub fn show(ui: &mut Ui, state: ListState<'_>, actions: &mut Vec<Action>) {
     );
     ui.add_space(18.0);
 
-    let visible = visible_downloads(state.downloads, state.filter, state.search, state.order);
+    let visible = state.visible;
     let completed = visible
         .iter()
         .filter(|download| download.status == DownloadStatus::Completed)
@@ -89,21 +93,21 @@ pub fn show(ui: &mut Ui, state: ListState<'_>, actions: &mut Vec<Action>) {
     let style = theme::form().rows;
     match style {
         // Each row is a card of its own, so the list sits on the page.
-        RowStyle::Cards => download_rows(ui, &state, &visible, style, actions),
+        RowStyle::Cards => download_rows(ui, &state, visible, style, actions),
         RowStyle::Lines | RowStyle::Bands => {
             theme::card(ui, LIST_CARD_MARGIN, |ui| {
                 ui.set_min_size(ui.available_size().max(egui::Vec2::ZERO));
-                download_rows(ui, &state, &visible, style, actions);
+                download_rows(ui, &state, visible, style, actions);
             });
         }
     }
 }
 
 /// The column header and the scrolling rows, or the empty state.
-fn download_rows(
+fn download_rows<'a>(
     ui: &mut Ui,
     state: &ListState<'_>,
-    visible: &[&DownloadView],
+    visible: &'a [&'a DownloadView],
     style: RowStyle,
     actions: &mut Vec<Action>,
 ) {
@@ -115,19 +119,23 @@ fn download_rows(
     let columns = Columns::for_width(geometry.content_width(ui.available_width()));
     let sorting = sorting_for(state.filter, state.order);
     header(ui, &columns, style, geometry, sorting, actions);
+    let shown = state.selection.shown(visible);
     let rows = RowList {
         catalog: state.catalog,
         columns: &columns,
         style,
         geometry,
+        visible,
+        selection: state.selection,
+        shown: &shown,
     };
+    // A queue view shows the start order, so its rows can be dragged and
+    // moved; other views are filtered lists.
+    let in_queue = matches!(sorting, Sorting::StartOrderOnly);
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(geometry.edge_room());
-            // A queue view shows the start order, so its rows can be
-            // dragged and moved; other views are filtered lists.
-            let in_queue = matches!(sorting, Sorting::StartOrderOnly);
             let first = visible.first().map(|download| download.id);
             for (index, download) in visible.iter().enumerate() {
                 let reorder = match first {
@@ -137,17 +145,52 @@ fn download_rows(
                     },
                     _ => Reorder::Off,
                 };
-                row(
-                    ui,
-                    &rows,
-                    index,
-                    download,
-                    state.selected == Some(download.id),
-                    reorder,
-                    actions,
-                );
+                row(ui, &rows, index, download, reorder, actions);
             }
             ui.add_space(geometry.edge_room());
+        });
+    dragged_badge(ui.ctx(), in_queue);
+}
+
+/// What a dragged row carries: the downloads it moves, in list order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraggedDownloads(pub Vec<DownloadId>);
+
+/// While rows are dragged, a badge at the pointer says how many and where
+/// they can go: in a queue view, rows also take a drop to reorder.
+fn dragged_badge(ctx: &egui::Context, in_queue: bool) {
+    let Some(dragged) = egui::DragAndDrop::payload::<DraggedDownloads>(ctx) else {
+        return;
+    };
+    let Some(pointer) = ctx.pointer_interact_pos() else {
+        return;
+    };
+    let count = match dragged.0.len() {
+        1 => "1 download".to_owned(),
+        many => format!("{many} downloads"),
+    };
+    let hint = if in_queue {
+        "Drop between rows to reorder, or on a queue to move"
+    } else {
+        "Drop on a queue to move"
+    };
+    egui::Area::new(egui::Id::new("dragged-downloads"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(pointer + vec2(16.0, 12.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(count)
+                        .font(theme::semibold(13.0))
+                        .color(theme::ink()),
+                );
+                ui.label(
+                    egui::RichText::new(hint)
+                        .font(theme::regular(12.0))
+                        .color(theme::ink_soft()),
+                );
+            });
         });
 }
 
@@ -912,6 +955,24 @@ struct RowList<'a> {
     columns: &'a Columns,
     style: RowStyle,
     geometry: RowGeometry,
+    /// The rows as shown, which a drag or a group menu acts on in order.
+    visible: &'a [&'a DownloadView],
+    selection: &'a Selection,
+    /// The picks among `visible`.
+    shown: &'a Shown<'a>,
+}
+
+impl<'a> RowList<'a> {
+    /// The downloads a drag or right-click on `download` acts on: the shown
+    /// group when it is one of them, otherwise it alone.
+    fn group_of(&self, download: &'a DownloadView) -> Vec<&'a DownloadView> {
+        match self.shown {
+            Shown::Group(group) if group.iter().any(|picked| picked.id == download.id) => {
+                group.clone()
+            }
+            Shown::Nothing | Shown::One(_) | Shown::Group(_) => vec![download],
+        }
+    }
 }
 
 /// How strongly a row stands out from its neighbors.
@@ -1016,12 +1077,11 @@ enum Reorder {
     },
 }
 
-fn row(
+fn row<'a>(
     ui: &mut Ui,
-    list: &RowList<'_>,
+    list: &RowList<'a>,
     index: usize,
-    download: &DownloadView,
-    selected: bool,
+    download: &'a DownloadView,
     reorder: Reorder,
     actions: &mut Vec<Action>,
 ) {
@@ -1030,13 +1090,15 @@ fn row(
         columns,
         style,
         geometry,
+        selection,
+        ..
     } = *list;
-    let sense = match reorder {
-        Reorder::Off => Sense::click(),
-        Reorder::InQueue { .. } => Sense::click_and_drag(),
-    };
-    let (slot, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), geometry.slot_height()), sense);
+    let selected = selection.contains(download.id);
+    // Every row drags: onto a queue in the sidebar, or within a queue view.
+    let (slot, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), geometry.slot_height()),
+        Sense::click_and_drag(),
+    );
     if !ui.is_rect_visible(slot) {
         return;
     }
@@ -1145,30 +1207,45 @@ fn row(
         )
         .clicked()
         {
-            actions.push(Action::AskRemove(download.id));
+            actions.push(Action::AskRemove(vec![download.id]));
         }
     }
 
+    if response.dragged() {
+        let group = list.group_of(download);
+        response.dnd_set_drag_payload(DraggedDownloads(
+            group.iter().map(|dragged| dragged.id).collect(),
+        ));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
     if let Reorder::InQueue { next, .. } = reorder {
-        drag_to_reorder(ui, &response, slot, download.id, next, actions);
+        drop_to_reorder(ui, &response, slot, download.id, next, actions);
     }
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-    if response.secondary_clicked() {
+    // Right-clicking a picked row keeps the group, so its menu acts on all.
+    if response.secondary_clicked() && !selected {
         actions.push(Action::Select(Some(download.id)));
     }
-    response.context_menu(|ui| row_menu(ui, download, catalog, reorder, actions));
+    response.context_menu(|ui| {
+        let group = list.group_of(download);
+        match group.as_slice() {
+            [one] => row_menu(ui, one, catalog, reorder, actions),
+            _ => group_menu(ui, &group, list, reorder, actions),
+        }
+    });
     if response.double_clicked() {
         if let Some(file) = download.finished_file() {
             actions.push(Action::OpenFile(file.to_path_buf()));
         }
     } else if response.clicked() {
-        actions.push(Action::Select(Some(download.id)));
+        let pick = Pick::from_modifiers(ui.input(|input| input.modifiers));
+        actions.push(Action::Pick(download.id, pick));
     }
 }
 
-/// Dragging a row in a queue view: the row carries its id, a line shows
-/// where it would land, and releasing over a row moves it there.
-fn drag_to_reorder(
+/// Dropping dragged rows on a row in a queue view: a line shows where they
+/// would land, and releasing moves them there together.
+fn drop_to_reorder(
     ui: &Ui,
     response: &egui::Response,
     rect: Rect,
@@ -1176,10 +1253,6 @@ fn drag_to_reorder(
     next: Option<DownloadId>,
     actions: &mut Vec<Action>,
 ) {
-    if response.dragged() {
-        response.dnd_set_drag_payload(id);
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-    }
     let Some(pointer) = ui.ctx().pointer_interact_pos() else {
         return;
     };
@@ -1189,8 +1262,8 @@ fn drag_to_reorder(
     } else {
         next.map_or(QueuePlace::End, QueuePlace::Before)
     };
-    if let Some(dragged) = response.dnd_hover_payload::<DownloadId>() {
-        if *dragged != id {
+    if let Some(dragged) = response.dnd_hover_payload::<DraggedDownloads>() {
+        if !dragged.0.contains(&id) {
             let y = if upper_half {
                 rect.top()
             } else {
@@ -1205,9 +1278,9 @@ fn drag_to_reorder(
             painter.circle_filled(pos2(rect.left() + 8.0, y), 4.0, theme::primary());
         }
     }
-    if let Some(dragged) = response.dnd_release_payload::<DownloadId>() {
-        if *dragged != id {
-            actions.push(Action::MoveInQueue(*dragged, place));
+    if let Some(dragged) = response.dnd_release_payload::<DraggedDownloads>() {
+        if !dragged.0.contains(&id) {
+            actions.push(Action::MoveInQueue(dragged.0.clone(), place));
         }
     }
 }
@@ -1271,7 +1344,7 @@ fn row_menu(
     if download.can_start_now {
         menu_item(ui, actions, "Start now", Action::StartNow(download.id));
     }
-    if download.status.can_resume() && download.received > 0 {
+    if can_start_over(download) {
         menu_item(ui, actions, "Start over", Action::Restart(download.id));
     }
     if let Reorder::InQueue { first, .. } = reorder {
@@ -1280,14 +1353,14 @@ fn row_menu(
                 ui,
                 actions,
                 "Move to top of queue",
-                Action::MoveInQueue(download.id, QueuePlace::Before(first)),
+                Action::MoveInQueue(vec![download.id], QueuePlace::Before(first)),
             );
         }
         menu_item(
             ui,
             actions,
             "Move to bottom of queue",
-            Action::MoveInQueue(download.id, QueuePlace::End),
+            Action::MoveInQueue(vec![download.id], QueuePlace::End),
         );
     }
     ui.menu_button("Move to queue", |ui| {
@@ -1297,7 +1370,7 @@ fn row_menu(
                 .add_enabled(!current, egui::Button::new(&queue.name))
                 .clicked()
             {
-                actions.push(Action::MoveToQueue(download.id, queue.id));
+                actions.push(Action::MoveToQueue(vec![download.id], queue.id));
                 ui.close_menu();
             }
         }
@@ -1330,8 +1403,238 @@ fn row_menu(
         ui,
         actions,
         &hotkeys::REMOVE.label("Remove…"),
-        Action::AskRemove(download.id),
+        Action::AskRemove(vec![download.id]),
     );
+}
+
+/// Whether a download has data that starting over would throw away.
+fn can_start_over(download: &DownloadView) -> bool {
+    download.status.can_resume() && download.received > 0
+}
+
+/// What the right-click menu can do for several picked downloads: each
+/// list holds the ones an item applies to.
+#[derive(Debug, PartialEq, Eq)]
+struct GroupPlan {
+    ids: Vec<DownloadId>,
+    resume: Vec<DownloadId>,
+    pause: Vec<DownloadId>,
+    start_now: Vec<DownloadId>,
+    start_over: Vec<DownloadId>,
+    /// The queue all of them are in already, if they share one.
+    shared_queue: Option<QueueId>,
+    reorder: GroupReorder,
+}
+
+/// Moving a group within the start order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupReorder {
+    /// Not a queue view, so the start order is not shown.
+    Off,
+    /// The group is the first rows of the queue already.
+    OnTop,
+    /// Moving it to the top puts it at this place.
+    ToTop(QueuePlace),
+}
+
+fn group_plan(group: &[&DownloadView], visible: &[&DownloadView], reorder: Reorder) -> GroupPlan {
+    let ids: Vec<DownloadId> = group.iter().map(|download| download.id).collect();
+    let where_ = |applies: fn(&DownloadView) -> bool| {
+        group
+            .iter()
+            .filter(|download| applies(download))
+            .map(|download| download.id)
+            .collect()
+    };
+    // Each row's own button decides what it can do, so the group does it
+    // where that button would.
+    let (mut resume, mut pause) = (Vec::new(), Vec::new());
+    for download in group {
+        match primary_kind(download) {
+            Some(PrimaryKind::Resume) => resume.push(download.id),
+            Some(PrimaryKind::Pause) => pause.push(download.id),
+            None => {}
+        }
+    }
+    let first_queue = group.first().map(|download| download.queue);
+    let shared_queue =
+        first_queue.filter(|queue| group.iter().all(|download| download.queue == *queue));
+    let reorder = match reorder {
+        Reorder::Off => GroupReorder::Off,
+        Reorder::InQueue { first, .. } => {
+            let on_top = visible
+                .iter()
+                .take(group.len())
+                .all(|shown| ids.contains(&shown.id));
+            if on_top {
+                GroupReorder::OnTop
+            } else {
+                GroupReorder::ToTop(QueuePlace::Before(first))
+            }
+        }
+    };
+    GroupPlan {
+        resume,
+        pause,
+        start_now: where_(|download| download.can_start_now),
+        start_over: where_(can_start_over),
+        shared_queue,
+        reorder,
+        ids,
+    }
+}
+
+/// The right-click menu for several picked downloads: the same items as for
+/// one, in the same places, with those that need a single file turned off.
+fn group_menu(
+    ui: &mut Ui,
+    group: &[&DownloadView],
+    list: &RowList<'_>,
+    reorder: Reorder,
+    actions: &mut Vec<Action>,
+) {
+    ui.set_min_width(220.0);
+    let plan = group_plan(group, list.visible, reorder);
+    let each = |ids: &[DownloadId], action: fn(DownloadId) -> Action| -> Vec<Action> {
+        ids.iter().copied().map(action).collect()
+    };
+    ui.label(
+        egui::RichText::new(format!("{} downloads selected", group.len()))
+            .font(theme::semibold(12.5))
+            .color(theme::ink_soft()),
+    );
+    ui.separator();
+    single_file_item(ui, &hotkeys::OPEN_FILE.label("Open file"));
+    single_file_item(ui, &hotkeys::RENAME.label("Rename file"));
+    single_file_item(ui, &hotkeys::SHOW_IN_FOLDER.label("Show in folder"));
+    ui.separator();
+    group_item(
+        ui,
+        actions,
+        GroupItem {
+            label: "Resume",
+            does: each(&plan.resume, Action::Resume),
+            off_because: Some("None of them is paused or failed"),
+        },
+    );
+    group_item(
+        ui,
+        actions,
+        GroupItem {
+            label: "Pause",
+            does: each(&plan.pause, Action::Pause),
+            off_because: Some("None of them is downloading or waiting"),
+        },
+    );
+    group_item(
+        ui,
+        actions,
+        GroupItem {
+            label: "Start now",
+            does: each(&plan.start_now, Action::StartNow),
+            off_because: Some("None of them is waiting for its queue"),
+        },
+    );
+    group_item(
+        ui,
+        actions,
+        GroupItem {
+            label: "Start over",
+            does: each(&plan.start_over, Action::Restart),
+            off_because: Some("None of them has data to start over from"),
+        },
+    );
+    let to_top = match plan.reorder {
+        GroupReorder::Off => None,
+        GroupReorder::OnTop => Some(Vec::new()),
+        GroupReorder::ToTop(place) => Some(vec![Action::MoveInQueue(plan.ids.clone(), place)]),
+    };
+    if let Some(to_top) = to_top {
+        group_item(
+            ui,
+            actions,
+            GroupItem {
+                label: "Move to top of queue",
+                does: to_top,
+                off_because: Some("Already at the top of the queue"),
+            },
+        );
+        group_item(
+            ui,
+            actions,
+            GroupItem {
+                label: "Move to bottom of queue",
+                does: vec![Action::MoveInQueue(plan.ids.clone(), QueuePlace::End)],
+                off_because: None,
+            },
+        );
+    }
+    ui.menu_button("Move to queue", |ui| {
+        for queue in list.catalog.queues {
+            let all_there = plan.shared_queue == Some(queue.id);
+            if ui
+                .add_enabled(!all_there, egui::Button::new(&queue.name))
+                .on_disabled_hover_text("They are all in this queue")
+                .clicked()
+            {
+                actions.push(Action::MoveToQueue(plan.ids.clone(), queue.id));
+                ui.close_menu();
+            }
+        }
+    });
+    single_file_item(ui, "Speed limit");
+    ui.separator();
+    single_file_item(ui, "Open download page");
+    single_file_item(ui, "Refresh download address…");
+    let addresses = group
+        .iter()
+        .map(|download| download.url.to_string())
+        .collect();
+    group_item(
+        ui,
+        actions,
+        GroupItem {
+            label: "Copy addresses",
+            does: vec![Action::CopyAddresses(addresses)],
+            off_because: None,
+        },
+    );
+    ui.separator();
+    group_item(
+        ui,
+        actions,
+        GroupItem {
+            label: &hotkeys::REMOVE.label("Remove…"),
+            does: vec![Action::AskRemove(plan.ids.clone())],
+            off_because: None,
+        },
+    );
+}
+
+/// One group menu item: what it does, and why it is off when it does
+/// nothing (`None` for an item that always does something).
+struct GroupItem<'a> {
+    label: &'a str,
+    does: Vec<Action>,
+    off_because: Option<&'a str>,
+}
+
+fn group_item(ui: &mut Ui, actions: &mut Vec<Action>, item: GroupItem<'_>) {
+    let applies = !item.does.is_empty();
+    let mut button = ui.add_enabled(applies, egui::Button::new(item.label));
+    if let Some(reason) = item.off_because {
+        button = button.on_disabled_hover_text(reason);
+    }
+    if button.clicked() {
+        actions.extend(item.does);
+        ui.close_menu();
+    }
+}
+
+/// A menu item that needs one download, shown turned off for a group.
+fn single_file_item(ui: &mut Ui, label: &str) {
+    ui.add_enabled(false, egui::Button::new(label))
+        .on_disabled_hover_text("Select a single download for this");
 }
 
 /// Own limits offered for a download, in KiB/s.
@@ -1472,24 +1775,42 @@ pub fn location(download: &DownloadView) -> std::path::PathBuf {
         .unwrap_or_else(|| download.directory.clone())
 }
 
-// The pause/resume/retry button offered for a download in its current state.
-pub fn primary_row_action(download: &DownloadView) -> Option<(Icon, &'static str, Action)> {
+/// What a download's main button does in its current state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimaryKind {
+    Pause,
+    /// Resume, retry, or try again after the disk filled up.
+    Resume,
+}
+
+fn primary_kind(download: &DownloadView) -> Option<PrimaryKind> {
     if download.stopping {
         return None;
     }
     match download.status {
         DownloadStatus::Queued | DownloadStatus::Connecting | DownloadStatus::Downloading => {
-            Some((Icon::Pause, "Pause", Action::Pause(download.id)))
+            Some(PrimaryKind::Pause)
         }
-        DownloadStatus::Paused => Some((Icon::Play, "Resume", Action::Resume(download.id))),
-        DownloadStatus::Failed { .. } => {
-            Some((Icon::Refresh, "Retry", Action::Resume(download.id)))
-        }
-        DownloadStatus::WaitingForSpace { .. } => {
-            Some((Icon::Refresh, "Try again now", Action::Resume(download.id)))
-        }
+        DownloadStatus::Paused
+        | DownloadStatus::Failed { .. }
+        | DownloadStatus::WaitingForSpace { .. } => Some(PrimaryKind::Resume),
         DownloadStatus::Completed => None,
     }
+}
+
+// The pause/resume/retry button offered for a download in its current state.
+pub fn primary_row_action(download: &DownloadView) -> Option<(Icon, &'static str, Action)> {
+    let id = download.id;
+    Some(match primary_kind(download)? {
+        PrimaryKind::Pause => (Icon::Pause, "Pause", Action::Pause(id)),
+        PrimaryKind::Resume => match download.status {
+            DownloadStatus::Failed { .. } => (Icon::Refresh, "Retry", Action::Resume(id)),
+            DownloadStatus::WaitingForSpace { .. } => {
+                (Icon::Refresh, "Try again now", Action::Resume(id))
+            }
+            _ => (Icon::Play, "Resume", Action::Resume(id)),
+        },
+    })
 }
 
 fn progress_cell(ui: &Ui, download: &DownloadView, cell: Rect) {
@@ -1611,6 +1932,7 @@ pub fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixtures::view;
     use super::*;
 
     #[test]
@@ -1722,35 +2044,6 @@ mod tests {
         );
     }
 
-    fn view(id: u64) -> DownloadView {
-        DownloadView {
-            id: DownloadId(id),
-            file_name: format!("file-{id}.zip"),
-            url: url::Url::parse("https://example.com/file.zip").unwrap(),
-            page_url: None,
-            referrer: None,
-            queue: downpour_core::QueueId::MAIN,
-            directory: std::path::PathBuf::from("downloads"),
-            target: None,
-            category: downpour_core::CategoryId::OTHER,
-            status: DownloadStatus::Queued,
-            size: None,
-            received: 0,
-            bytes_per_second: 0,
-            connections: 0,
-            segments: Vec::new(),
-            resumable: None,
-            size_is_estimate: false,
-            progress_fraction: None,
-            stream: None,
-            added_at_unix: 0,
-            finished_at_unix: None,
-            stopping: false,
-            speed_limit: DownloadLimit::FollowSettings,
-            can_start_now: false,
-        }
-    }
-
     #[test]
     fn arrows_walk_the_list_and_stop_at_its_ends() {
         let views: Vec<DownloadView> = (1..=3).map(view).collect();
@@ -1829,5 +2122,67 @@ mod tests {
     fn arrows_on_an_empty_list_select_nothing() {
         assert!(neighbor(&[], None, Step::Previous).is_none());
         assert!(neighbor(&[], None, Step::Next).is_none());
+    }
+
+    fn in_queue(first: u64) -> Reorder {
+        Reorder::InQueue {
+            first: DownloadId(first),
+            next: None,
+        }
+    }
+
+    #[test]
+    fn a_group_menu_does_each_thing_where_it_applies() {
+        let paused = DownloadView {
+            status: DownloadStatus::Paused,
+            received: 10,
+            ..view(1)
+        };
+        let running = DownloadView {
+            status: DownloadStatus::Downloading,
+            ..view(2)
+        };
+        let finished = DownloadView {
+            status: DownloadStatus::Completed,
+            ..view(3)
+        };
+        let group = [&paused, &running, &finished];
+        let plan = group_plan(&group, &group, Reorder::Off);
+        assert_eq!(plan.resume, [DownloadId(1)]);
+        assert_eq!(plan.pause, [DownloadId(2)]);
+        assert_eq!(plan.start_over, [DownloadId(1)]);
+        assert!(plan.start_now.is_empty());
+        assert_eq!(plan.reorder, GroupReorder::Off);
+    }
+
+    #[test]
+    fn a_group_on_top_of_its_queue_cannot_move_to_the_top() {
+        let (one, two, three) = (view(1), view(2), view(3));
+        let visible = [&one, &two, &three];
+        assert_eq!(
+            group_plan(&[&one, &two], &visible, in_queue(1)).reorder,
+            GroupReorder::OnTop
+        );
+        assert_eq!(
+            group_plan(&[&two, &three], &visible, in_queue(1)).reorder,
+            GroupReorder::ToTop(QueuePlace::Before(DownloadId(1)))
+        );
+    }
+
+    #[test]
+    fn a_group_shares_a_queue_only_when_all_are_in_it() {
+        let (one, two) = (view(1), view(2));
+        let elsewhere = DownloadView {
+            queue: QueueId(7),
+            ..view(3)
+        };
+        assert_eq!(
+            group_plan(&[&one, &two], &[&one, &two], Reorder::Off).shared_queue,
+            Some(QueueId::MAIN)
+        );
+        assert_eq!(
+            group_plan(&[&one, &elsewhere], &[&one, &elsewhere], Reorder::Off).shared_queue,
+            None
+        );
     }
 }

@@ -883,17 +883,31 @@ impl DownloadManager {
         Ok(())
     }
 
-    pub fn move_to_queue(&self, download: DownloadId, queue: QueueId) -> Result<(), ManagerError> {
+    /// Moves downloads to `queue`: all of them, or none if one is unknown.
+    pub fn move_to_queue(
+        &self,
+        downloads: &[DownloadId],
+        queue: QueueId,
+    ) -> Result<(), ManagerError> {
         {
             let mut state = self.state();
             if !state.queues.contains(queue) {
                 return Err(QueueError::Unknown(queue).into());
             }
-            let entry = state
-                .downloads
-                .get_mut(&download)
-                .ok_or(ManagerError::UnknownDownload(download))?;
-            entry.record.queue = queue;
+            // All of them or none: check every download before moving one.
+            if let Some(unknown) = downloads
+                .iter()
+                .find(|id| !state.downloads.contains_key(id))
+            {
+                return Err(ManagerError::UnknownDownload(*unknown));
+            }
+            for id in downloads {
+                let entry = state
+                    .downloads
+                    .get_mut(id)
+                    .expect("every download was checked above");
+                entry.record.queue = queue;
+            }
         }
         self.changed_and_persist();
         self.start_queued();
@@ -977,21 +991,26 @@ impl DownloadManager {
             .collect()
     }
 
-    /// Moves a download within the start order. Downloads already running
-    /// keep running; the order decides which waiting one starts next.
-    pub fn move_in_queue(&self, id: DownloadId, place: QueuePlace) -> Result<(), ManagerError> {
+    /// Moves downloads within the start order, together and in the order
+    /// they had. Downloads already running keep running; the order decides
+    /// which waiting one starts next. Saved once for the whole group.
+    pub fn move_in_queue(&self, ids: &[DownloadId], place: QueuePlace) -> Result<(), ManagerError> {
         {
             let mut state = self.state();
-            for known in std::iter::once(id).chain(match place {
+            let target = match place {
                 QueuePlace::Before(target) => Some(target),
                 QueuePlace::End => None,
-            }) {
-                if !state.downloads.contains_key(&known) {
-                    return Err(ManagerError::UnknownDownload(known));
-                }
+            };
+            if let Some(unknown) = ids
+                .iter()
+                .copied()
+                .chain(target)
+                .find(|id| !state.downloads.contains_key(id))
+            {
+                return Err(ManagerError::UnknownDownload(unknown));
             }
             let order: Vec<DownloadId> = state.in_order().map(|entry| entry.record.id).collect();
-            let order = ordering::reordered(&order, id, place);
+            let order = ordering::reordered(&order, ids, place);
             for (id, position) in order.into_iter().zip(1..) {
                 if let Some(entry) = state.downloads.get_mut(&id) {
                     entry.record.position = position;

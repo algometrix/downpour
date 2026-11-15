@@ -6,6 +6,8 @@
 
 mod details;
 mod dialogs;
+#[cfg(test)]
+mod fixtures;
 pub mod format;
 mod hotkeys;
 pub mod icons;
@@ -14,13 +16,14 @@ mod list;
 mod live_speed;
 #[cfg(debug_assertions)]
 pub mod screenshot;
+mod selection;
 mod sidebar;
 mod stats;
 mod theme;
 mod toasts;
 mod widgets;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +50,7 @@ use dialogs::{
     AddUrlForm, BrowserForm, CategoriesForm, Dialog, DialogCommand, DuplicateForm, QueueForm,
     RefreshForm, RemoveForm, RenameFileForm, SettingsForm,
 };
+use selection::{Pick, Selection};
 use theme::Placement;
 use toasts::{ToastKind, Toasts};
 
@@ -146,7 +150,10 @@ pub enum Page {
 
 /// Something the user asked for while the frame was drawn.
 pub enum Action {
+    /// Pick only this download, or none.
     Select(Option<DownloadId>),
+    /// A click on a row; the keys held decide how the selection changes.
+    Pick(DownloadId, Pick),
     SetFilter(Filter),
     ShowStatistics,
     RefreshStatistics,
@@ -156,7 +163,7 @@ pub enum Action {
     StartNow(DownloadId),
     SetSpeedLimit(DownloadId, DownloadLimit),
     Restart(DownloadId),
-    AskRemove(DownloadId),
+    AskRemove(Vec<DownloadId>),
     AskRename(DownloadId),
     /// Drop finished downloads from the list; their files and history stay.
     ClearCompleted,
@@ -175,9 +182,10 @@ pub enum Action {
     NewQueue,
     RenameQueue(QueueId),
     RemoveQueue(QueueId),
-    MoveToQueue(DownloadId, QueueId),
-    /// Change where a download stands in the start order.
-    MoveInQueue(DownloadId, QueuePlace),
+    MoveToQueue(Vec<DownloadId>, QueueId),
+    /// Change where downloads stand in the start order; a group moves
+    /// together.
+    MoveInQueue(Vec<DownloadId>, QueuePlace),
     /// Say that the order can be changed only where a queue is shown.
     ExplainQueueOrder,
     ManageCategories,
@@ -185,6 +193,8 @@ pub enum Action {
     /// Wait for the browser to send a fresh address for this download.
     RefreshAddress(DownloadId),
     CopyText(String),
+    /// Several downloads' addresses, one per line.
+    CopyAddresses(Vec<String>),
     /// Sort the list by this column, or change or end the sort by it.
     SortBy(SortColumn),
     /// A choice in the Sort menu.
@@ -200,7 +210,10 @@ pub struct App {
     page: Page,
     filter: Filter,
     search: String,
-    selected: Option<DownloadId>,
+    selection: Selection,
+    /// The rows the list shows this frame, in order: a Shift+click runs
+    /// through these.
+    shown_rows: Vec<DownloadId>,
     dialog: Option<Dialog>,
     pending_browser: VecDeque<Arrival>,
     /// The next link the browser sends replaces this download's address.
@@ -310,7 +323,8 @@ impl App {
             // The window opens on the main queue.
             filter: Filter::Queue(QueueId::MAIN),
             search: String::new(),
-            selected: None,
+            selection: Selection::default(),
+            shown_rows: Vec::new(),
             dialog: None,
             pending_browser: VecDeque::new(),
             awaiting_refresh: None,
@@ -449,7 +463,11 @@ impl App {
     fn apply(&mut self, action: Action, downloads: &[DownloadView]) {
         let result: Result<(), ManagerError> = match action {
             Action::Select(id) => {
-                self.selected = id;
+                self.selection = id.map_or_else(Selection::default, Selection::only);
+                Ok(())
+            }
+            Action::Pick(id, pick) => {
+                self.selection.pick(id, pick, &self.shown_rows);
                 Ok(())
             }
             Action::SetFilter(filter) => {
@@ -459,7 +477,7 @@ impl App {
             }
             Action::ShowStatistics => {
                 self.page = Page::Statistics;
-                self.selected = None;
+                self.selection.clear();
                 self.restart_statistics_intro();
                 Ok(())
             }
@@ -473,14 +491,13 @@ impl App {
             Action::StartNow(id) => self.manager.start_now(id),
             Action::SetSpeedLimit(id, limit) => self.manager.set_speed_limit(id, limit),
             Action::Restart(id) => self.manager.restart(id),
-            Action::AskRemove(id) => {
-                if let Some(download) = downloads.iter().find(|download| download.id == id) {
-                    let completed = download.status == DownloadStatus::Completed;
-                    self.dialog = Some(Dialog::Remove(RemoveForm::new(
-                        id,
-                        download.file_name.clone(),
-                        completed,
-                    )));
+            Action::AskRemove(ids) => {
+                let doomed: Vec<&DownloadView> = downloads
+                    .iter()
+                    .filter(|download| ids.contains(&download.id))
+                    .collect();
+                if let Some(form) = RemoveForm::for_downloads(&doomed) {
+                    self.dialog = Some(Dialog::Remove(form));
                 }
                 Ok(())
             }
@@ -520,7 +537,7 @@ impl App {
                 self.dialog = Some(Dialog::Settings(SettingsForm::new(&self.settings)));
                 Ok(())
             }
-            Action::MoveInQueue(id, place) => self.manager.move_in_queue(id, place),
+            Action::MoveInQueue(ids, place) => self.manager.move_in_queue(&ids, place),
             Action::ExplainQueueOrder => {
                 self.toasts.push(
                     ToastKind::Info,
@@ -581,7 +598,7 @@ impl App {
                 }
                 removed
             }
-            Action::MoveToQueue(download, queue) => self.manager.move_to_queue(download, queue),
+            Action::MoveToQueue(ids, queue) => self.move_to_queue(&ids, queue, downloads),
             Action::ManageCategories => {
                 self.dialog = Some(Dialog::Categories(CategoriesForm::new(
                     &self.settings.engine,
@@ -602,6 +619,16 @@ impl App {
                     ToastKind::Info,
                     "Copied",
                     "The address is on the clipboard.",
+                );
+                Ok(())
+            }
+            Action::CopyAddresses(addresses) => {
+                let count = addresses.len();
+                self.ctx.copy_text(addresses.join("\n"));
+                self.toasts.push(
+                    ToastKind::Info,
+                    "Copied",
+                    format!("{count} addresses are on the clipboard, one per line."),
                 );
                 Ok(())
             }
@@ -636,6 +663,38 @@ impl App {
                 "This download has no saved page. Open the site in your browser and start the download again.",
             ),
         }
+    }
+
+    /// Moves downloads to `queue` and says so: outside that queue's view
+    /// the list looks the same afterwards.
+    fn move_to_queue(
+        &mut self,
+        ids: &[DownloadId],
+        queue: QueueId,
+        downloads: &[DownloadView],
+    ) -> Result<(), ManagerError> {
+        let moving: Vec<&DownloadView> = downloads
+            .iter()
+            .filter(|download| ids.contains(&download.id) && download.queue != queue)
+            .collect();
+        if moving.is_empty() {
+            return Ok(());
+        }
+        let moving_ids: Vec<DownloadId> = moving.iter().map(|download| download.id).collect();
+        self.manager.move_to_queue(&moving_ids, queue)?;
+        let queue_name = self
+            .manager
+            .queues()
+            .into_iter()
+            .find(|known| known.id == queue)
+            .map_or_else(|| "the queue".to_owned(), |known| known.name);
+        let body = match moving.as_slice() {
+            [one] => one.file_name.clone(),
+            many => format!("{} downloads", many.len()),
+        };
+        self.toasts
+            .push(ToastKind::Info, format!("Moved to {queue_name}"), body);
+        Ok(())
     }
 
     /// The queue new downloads from the Add URL box go to.
@@ -693,7 +752,7 @@ impl App {
                 let name = request.file_name.as_ref().map(|name| name.value.clone());
                 match self.manager.add(request) {
                     Ok(id) => {
-                        self.selected = Some(id);
+                        self.selection = Selection::only(id);
                         let body = name
                             .unwrap_or_else(|| "The file name will come from the server.".into());
                         self.toasts.push(ToastKind::Info, "Download added", body);
@@ -748,7 +807,7 @@ impl App {
                         error.to_string(),
                     ),
                 }
-                self.selected = Some(id);
+                self.selection = Selection::only(id);
                 self.dialog = None;
             }
             DialogCommand::AddInstead(link) => {
@@ -784,20 +843,23 @@ impl App {
                 self.dialog = None;
                 self.page = Page::Downloads;
                 self.filter = Filter::All;
-                self.selected = Some(id);
+                self.selection = Selection::only(id);
                 show_window(ctx);
             }
-            DialogCommand::Remove { id, files } => {
-                if let Err(error) = self.manager.remove(id, files) {
-                    self.toasts.push(
-                        ToastKind::Error,
-                        "Could not remove the download",
-                        error.to_string(),
-                    );
+            DialogCommand::Remove { ids, files } => {
+                let failures: Vec<String> = ids
+                    .iter()
+                    .filter_map(|id| self.manager.remove(*id, files).err())
+                    .map(|error| error.to_string())
+                    .collect();
+                if let Some(first) = failures.first() {
+                    let title = match failures.len() {
+                        1 => "Could not remove the download".to_owned(),
+                        count => format!("Could not remove {count} downloads"),
+                    };
+                    self.toasts.push(ToastKind::Error, title, first.clone());
                 }
-                if self.selected == Some(id) {
-                    self.selected = None;
-                }
+                self.selection.retain(|id| !ids.contains(&id));
                 self.dialog = None;
             }
             DialogCommand::SaveSettings(settings) => {
@@ -1032,9 +1094,7 @@ impl App {
                 failures.push(error.to_string());
             }
         }
-        if self.selected.is_some_and(|id| finished.contains(&id)) {
-            self.selected = None;
-        }
+        self.selection.retain(|id| !finished.contains(&id));
         let cleared = finished.len() - failures.len();
         tracing::info!(
             cleared,
@@ -1066,7 +1126,7 @@ impl App {
     fn hotkey_actions(
         &mut self,
         ctx: &egui::Context,
-        downloads: &[DownloadView],
+        visible: &[&DownloadView],
         queues: &[Queue],
     ) -> Vec<Action> {
         use hotkeys::Command;
@@ -1075,16 +1135,9 @@ impl App {
             return Vec::new();
         }
         let on_list = self.page == Page::Downloads;
-        let visible = list::visible_downloads(
-            downloads,
-            self.filter,
-            &self.search,
-            self.settings.list_order,
-        );
-        let selected = self
-            .selected
-            .filter(|_| on_list)
-            .and_then(|id| visible.iter().copied().find(|download| download.id == id));
+        let shown = self.selection.shown(visible);
+        let selected = shown.one().filter(|_| on_list);
+        let picked = if on_list { shown.ids() } else { Vec::new() };
         let shown_queue = match self.filter {
             Filter::Queue(id) if on_list => queues.iter().find(|queue| queue.id == id),
             _ => None,
@@ -1119,11 +1172,11 @@ impl App {
                         Command::Next => list::Step::Next,
                         _ => list::Step::Previous,
                     };
-                    list::neighbor(&visible, self.selected, step)
+                    list::neighbor(visible, self.selection.focus(), step)
                         .map(|download| Action::Select(Some(download.id)))
                 }
                 Command::Next | Command::Previous => None,
-                Command::Deselect => selected.map(|_| Action::Select(None)),
+                Command::Deselect => (!self.selection.is_empty()).then_some(Action::Select(None)),
                 Command::Primary => selected
                     .and_then(list::primary_row_action)
                     .map(|(_, _, action)| action),
@@ -1136,7 +1189,7 @@ impl App {
                 Command::CopyAddress => {
                     selected.map(|download| Action::CopyText(download.url.to_string()))
                 }
-                Command::Remove => selected.map(|download| Action::AskRemove(download.id)),
+                Command::Remove => (!picked.is_empty()).then(|| Action::AskRemove(picked.clone())),
                 Command::Rename => selected.map(|download| Action::AskRename(download.id)),
                 Command::MoveUp | Command::MoveDown => {
                     let step = match command {
@@ -1148,8 +1201,8 @@ impl App {
                     if shown_queue.is_none() {
                         return Some(Action::ExplainQueueOrder);
                     }
-                    list::place_after_step(&visible, download.id, step)
-                        .map(|place| Action::MoveInQueue(download.id, place))
+                    list::place_after_step(visible, download.id, step)
+                        .map(|place| Action::MoveInQueue(vec![download.id], place))
                 }
             })
             .collect()
@@ -1303,19 +1356,24 @@ impl eframe::App for App {
         self.desktop.update(&downloads, &self.settings, title_bars);
         let queues = self.manager.queues();
         self.announce_transitions(&downloads);
-        if self
-            .selected
-            .is_some_and(|id| !downloads.iter().any(|download| download.id == id))
-        {
-            self.selected = None;
-        }
+        let present: HashSet<DownloadId> = downloads.iter().map(|download| download.id).collect();
+        self.selection.retain(|id| present.contains(&id));
         if let Filter::Queue(id) = self.filter {
             if !queues.iter().any(|queue| queue.id == id) {
                 self.filter = Filter::Queue(QueueId::MAIN);
             }
         }
 
-        let mut actions = self.hotkey_actions(ctx, &downloads, &queues);
+        // One list of shown rows per frame, for the shortcuts, the details
+        // panel, the list, and the clicks applied after it is drawn.
+        let visible = list::visible_downloads(
+            &downloads,
+            self.filter,
+            &self.search,
+            self.settings.list_order,
+        );
+        self.shown_rows = visible.iter().map(|download| download.id).collect();
+        let mut actions = self.hotkey_actions(ctx, &visible, &queues);
         let categories = self.settings.engine.categories.clone();
         let catalog = Catalog {
             queues: &queues,
@@ -1353,10 +1411,12 @@ impl eframe::App for App {
                 )
             });
 
+        // Details are for one download; several picked show none.
         let selected = self
-            .selected
-            .filter(|_| self.page == Page::Downloads)
-            .and_then(|id| downloads.iter().find(|download| download.id == id));
+            .selection
+            .shown(&visible)
+            .one()
+            .filter(|_| self.page == Page::Downloads);
         if let Some(download) = selected {
             let compact = ctx.screen_rect().width() < COMPACT_WINDOW_WIDTH;
             egui::SidePanel::right("details")
@@ -1404,8 +1464,9 @@ impl eframe::App for App {
                         catalog: &catalog,
                         filter: self.filter,
                         search: &mut self.search,
-                        selected: self.selected,
+                        selection: &self.selection,
                         order: self.settings.list_order,
+                        visible: &visible,
                     };
                     list::show(ui, state, &mut actions);
                 }

@@ -1017,7 +1017,7 @@ async fn moving_a_download_to_the_top_starts_it_first() {
         );
     }
     manager
-        .move_in_queue(ids[2], downpour_core::QueuePlace::Before(ids[0]))
+        .move_in_queue(&[ids[2]], downpour_core::QueuePlace::Before(ids[0]))
         .unwrap();
     let names: Vec<String> = manager
         .snapshot()
@@ -1655,4 +1655,69 @@ async fn changing_only_the_case_renames_the_file() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(listed, vec![upper]);
+}
+
+/// Queued downloads that never start: the queue is stopped and the address
+/// is never asked for.
+fn held_downloads(manager: &DownloadManager, names: &[&str]) -> Vec<downpour_core::DownloadId> {
+    manager.stop_queue(downpour_core::QueueId::MAIN).unwrap();
+    names
+        .iter()
+        .map(|name| {
+            let url = Url::parse(&format!("http://127.0.0.1:9/{name}")).unwrap();
+            manager
+                .add(NewDownload::from_user(
+                    url,
+                    Some(name),
+                    None,
+                    StartMode::Queue,
+                ))
+                .unwrap()
+        })
+        .collect()
+}
+
+fn names_in_order(manager: &DownloadManager) -> Vec<String> {
+    manager
+        .snapshot()
+        .into_iter()
+        .map(|view| view.file_name)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_moves_together_in_the_start_order() {
+    let dir = temp_dir("group-reorder");
+    let manager = manager_in(&dir, 1);
+    let ids = held_downloads(&manager, &["a.bin", "b.bin", "c.bin"]);
+
+    // Picked out of order, the group keeps the order it had.
+    manager
+        .move_in_queue(&[ids[2], ids[0]], downpour_core::QueuePlace::Before(ids[1]))
+        .unwrap();
+
+    assert_eq!(names_in_order(&manager), ["a.bin", "c.bin", "b.bin"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_to_a_queue_moves_all_or_none() {
+    let dir = temp_dir("group-queue");
+    let manager = manager_in(&dir, 1);
+    let ids = held_downloads(&manager, &["a.bin", "b.bin"]);
+    let later = manager.add_queue("Later").unwrap();
+
+    let unknown = downpour_core::DownloadId(u64::MAX);
+    assert!(matches!(
+        manager.move_to_queue(&[ids[0], unknown], later),
+        Err(downpour_core::ManagerError::UnknownDownload(id)) if id == unknown
+    ));
+    let queues: Vec<_> = manager.snapshot().iter().map(|view| view.queue).collect();
+    assert_eq!(
+        queues,
+        [downpour_core::QueueId::MAIN, downpour_core::QueueId::MAIN]
+    );
+
+    manager.move_to_queue(&ids, later).unwrap();
+    let queues: Vec<_> = manager.snapshot().iter().map(|view| view.queue).collect();
+    assert_eq!(queues, [later, later]);
 }
