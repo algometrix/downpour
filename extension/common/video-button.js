@@ -7,20 +7,29 @@
 // mouse events, so the button follows the pointer position across the whole
 // window and checks which video lies under it, instead of relying on hover
 // events of the video element.
+//
+// Once the frame's main video is seen loading a stream or file, the button
+// stays on it without a hover, so it is there as soon as the video loads.
+// Only videos in the page's own DOM are pinned; a video inside a shadow root
+// gets the button on hover only.
 
 (() => {
   // Smaller videos are previews, ads, or thumbnails.
-  const MIN_WIDTH = 200;
-  const MIN_HEIGHT = 120;
   const HIDE_DELAY_MS = 1500;
   const NOTICE_MS = 2600;
   const EDGE_GAP = 8;
   // Custom players nest their <video> in shadow roots, sometimes in layers.
   const MAX_SHADOW_DEPTH = 4;
+  // How far up from a hidden <video> its player's box is looked for.
+  const MAX_CONTAINER_DEPTH = 3;
   const TITLE = "Download the best quality with Downpour";
 
   let enabled = true;
+  // The stored settings this button follows; capture-rules.js is loaded
+  // before this script and owns what they mean.
+  let settings = { ...DownpourRules.DEFAULT_SETTINGS };
   let current = null; // the video the button is shown for
+  let pinned = null; // the frame's main video, where the button rests
   let hideTimer = null;
   let host = null;
   let parts = null; // the shadow DOM's elements, once created
@@ -36,29 +45,72 @@
   let pointer = null;
   let checkScheduled = false;
 
-  // The button is on until the stored setting says otherwise, so the first
-  // mouse moves are never missed while storage is read.
+  function follow(stored) {
+    settings = { ...settings, ...stored };
+    enabled = settings.videoButton !== false && !DownpourRules.isIgnoredLocalVideo(undefined, location.href, settings);
+    if (!enabled) turnOff();
+  }
+  follow({});
+
+  // Until the stored settings arrive, the defaults apply, so the first mouse
+  // moves are never missed while storage is read.
   browser.storage.local
-    .get({ videoButton: true })
-    .then((stored) => {
-      enabled = stored.videoButton !== false;
-      if (!enabled) hide();
-    })
-    .catch((error) => console.warn("Downpour: could not read the video button setting; keeping it on", error));
+    .get({ videoButton: true, captureLocalVideos: DownpourRules.DEFAULT_SETTINGS.captureLocalVideos })
+    .then(follow)
+    .catch((error) => console.warn("Downpour: could not read the video button settings; keeping the defaults", error));
 
   browser.storage.onChanged?.addListener((changes) => {
-    if ("videoButton" in changes) {
-      enabled = changes.videoButton.newValue !== false;
-      if (!enabled) hide();
+    const changed = {};
+    for (const name of ["videoButton", "captureLocalVideos"]) {
+      if (name in changes) changed[name] = changes[name].newValue;
     }
+    if (Object.keys(changed).length > 0) follow(changed);
   });
 
-  // Only size counts. Players often keep the <video> transparent or hidden
-  // under a poster until it plays, and the button should be there already.
+  function turnOff() {
+    pinned = null;
+    hide();
+  }
+
+  // Only size counts. Players often keep the <video> transparent under a
+  // poster until it plays, and the button should be there already.
   function isLarge(video) {
-    if (!video.isConnected) return false;
-    const rect = video.getBoundingClientRect();
-    return rect.width >= MIN_WIDTH && rect.height >= MIN_HEIGHT;
+    return video.isConnected && DownpourRules.isLargeBox(video.getBoundingClientRect());
+  }
+
+  /** The elements around `video` that may hold its player, nearest first. */
+  function surroundingElements(video) {
+    const elements = [];
+    let element = video.parentElement;
+    while (element && elements.length < MAX_CONTAINER_DEPTH) {
+      if (element === document.body || element === document.documentElement) break;
+      elements.push(element);
+      element = element.parentElement;
+    }
+    return elements;
+  }
+
+  /** The element the button sits in for `video`, or null (see DownpourRules.videoBoxChoice). */
+  function boxOf(video) {
+    if (!video.isConnected) return null;
+    const surrounding = surroundingElements(video);
+    const choice = DownpourRules.videoBoxChoice(
+      video.getBoundingClientRect(),
+      surrounding.map((element) => element.getBoundingClientRect()),
+    );
+    if (choice === null) return null;
+    return choice === -1 ? video : surrounding[choice];
+  }
+
+  /** The frame's largest video outside shadow roots, or null. */
+  function mainVideo() {
+    const boxed = [];
+    for (const video of document.getElementsByTagName("video")) {
+      const box = boxOf(video);
+      if (box) boxed.push({ video, rect: box.getBoundingClientRect() });
+    }
+    const index = DownpourRules.largestBox(boxed.map((entry) => entry.rect));
+    return index === -1 ? null : boxed[index].video;
   }
 
   function contains(rect, x, y) {
@@ -180,40 +232,35 @@
   /** Puts the button at the video's top-right corner, inside the viewport. */
   function place() {
     if (!current || !host) return;
-    if (!isLarge(current)) {
-      hide();
+    const box = boxOf(current);
+    if (!box) {
+      if (current === pinned) pinned = null;
+      leaveVideo();
       return;
     }
     // In fullscreen only the fullscreen element is drawn; move inside it.
     const container = document.fullscreenElement ?? document.documentElement;
     if (host.parentNode !== container) container.append(host);
-    const rect = current.getBoundingClientRect();
+    const rect = box.getBoundingClientRect();
     const width = parts.bar.offsetWidth || 40;
-    const top = Math.max(rect.top, fixedHeaderBottom(rect)) + EDGE_GAP;
-    const left = Math.min(rect.right, window.innerWidth) - width - EDGE_GAP;
-    host.style.transform = `translate(${Math.max(EDGE_GAP, left)}px, ${Math.max(EDGE_GAP, top)}px)`;
-  }
-
-  /**
-   * Bottom edge of a site header fixed over the top of the video, so the
-   * button is not hidden beneath it.
-   */
-  function fixedHeaderBottom(rect) {
-    if (rect.top > 0) return 0;
-    let bottom = 0;
-    for (const element of document.elementsFromPoint(rect.left + rect.width / 2, 1)) {
-      if (element === host || element === current || current.contains(element)) continue;
-      const style = getComputedStyle(element);
-      if (style.position === "fixed" || style.position === "sticky") {
-        const box = element.getBoundingClientRect();
-        if (box.height < window.innerHeight / 3) bottom = Math.max(bottom, box.bottom);
-      }
-    }
-    return bottom;
+    // The button sits at the video's top-right corner and scrolls with it,
+    // so it never covers the page outside the video. The fullscreen element
+    // is fixed to the screen; the page is positioned from its top-left.
+    const fullscreen = container === document.fullscreenElement;
+    host.style.position = fullscreen ? "fixed" : "absolute";
+    const { left, top } = DownpourRules.videoButtonPosition(rect, {
+      width,
+      visibleWidth: fullscreen ? window.innerWidth : document.documentElement.clientWidth,
+      scroll: fullscreen ? { x: 0, y: 0 } : { x: window.scrollX, y: window.scrollY },
+      gap: EDGE_GAP,
+    });
+    host.style.transform = `translate(${left}px, ${top}px)`;
   }
 
   function show(video) {
     if (!enabled) return;
+    // A page elsewhere can still play a video from this computer.
+    if (DownpourRules.isIgnoredLocalVideo(sourceOf(video), location.href, settings)) return;
     ensureButton();
     clearTimeout(hideTimer);
     if (current !== video) {
@@ -230,8 +277,12 @@
 
   function scheduleHide() {
     clearTimeout(hideTimer);
-    if (menuOpen) return;
-    hideTimer = setTimeout(hide, HIDE_DELAY_MS);
+    const hides = DownpourRules.videoButtonHidesWhenLeft({
+      menuOpen,
+      onMainVideo: current === pinned,
+      fullscreen: Boolean(document.fullscreenElement),
+    });
+    if (hides) hideTimer = setTimeout(leaveVideo, HIDE_DELAY_MS);
   }
 
   function hide() {
@@ -241,15 +292,64 @@
     current = null;
   }
 
+  /** The pointer left a video: hides the button, which goes back to the main video if it left that one. */
+  function leaveVideo() {
+    const left = current;
+    hide();
+    const returns = DownpourRules.videoButtonReturnsToMain({
+      leftMainVideo: left === pinned,
+      fullscreen: Boolean(document.fullscreenElement),
+    });
+    if (returns) showPinnedVideo();
+  }
+
+  /** Shows the button on the main video; forgets a main video that is gone. */
+  function showPinnedVideo() {
+    if (!pinned) return;
+    if (!boxOf(pinned)) {
+      pinned = null;
+      return;
+    }
+    show(pinned);
+  }
+
+  /**
+   * Keeps the button on the frame's main video once the add-on saw that
+   * video's stream or file load in this frame.
+   */
+  async function pinMainVideo() {
+    if (!enabled) return;
+    const video = mainVideo();
+    if (!video || video === pinned) return;
+    if (DownpourRules.isIgnoredLocalVideo(sourceOf(video), location.href, settings)) return;
+    const reply = await askQualities(video);
+    if (!reply?.detected || !enabled || video !== mainVideo()) return;
+    const previous = pinned;
+    pinned = video;
+    // The player may have replaced the element the button was resting on.
+    if (!current || current === previous || !current.isConnected) show(video);
+  }
+
+  /**
+   * The height the button shows: the stream's best quality, or the height
+   * the video plays at when its qualities are not known (a single file, or
+   * a stream with one quality).
+   */
+  function heightToShow() {
+    const best = choices[0]?.height;
+    if (best) return best;
+    return current?.videoHeight > 0 ? current.videoHeight : undefined;
+  }
+
   /** Draws the button from `status`, `choices`, and `menuOpen`. */
   function render() {
     if (!parts) return;
+    const shownHeight = heightToShow();
     const look = status.kind === "notice" ? status.outcome : status.kind;
     parts.bar.dataset.state = look;
     parts.icon.innerHTML = ICONS[look];
     parts.main.title = look === "done" ? "Sent to Downpour" : TITLE;
-    const best = choices[0]?.height;
-    parts.label.textContent = best ? `${best}p` : "";
+    parts.label.textContent = shownHeight ? `${shownHeight}p` : "";
     parts.more.hidden = choices.length < 2;
     parts.more.setAttribute("aria-expanded", String(menuOpen));
     parts.menu.hidden = !menuOpen;
@@ -267,18 +367,22 @@
   async function refreshChoices() {
     const video = current;
     if (!video) return;
-    let reply;
-    try {
-      reply = await browser.runtime.sendMessage({ type: "video-qualities", src: sourceOf(video) });
-    } catch (error) {
-      // The button still downloads the best quality, just without a menu.
-      console.warn("Downpour: could not list the video's qualities", error);
-      return;
-    }
+    const reply = await askQualities(video);
     if (video !== current || !Array.isArray(reply?.choices)) return;
     choices = reply.choices;
     if (choices.length < 2) menuOpen = false;
     render();
+  }
+
+  /** What the add-on knows about the video's stream, or null when it could not ask. */
+  async function askQualities(video) {
+    try {
+      return await browser.runtime.sendMessage({ type: "video-qualities", src: sourceOf(video) });
+    } catch (error) {
+      // The button still downloads the best quality, just without a menu.
+      console.warn("Downpour: could not list the video's qualities", error);
+      return null;
+    }
   }
 
   function openMenu() {
@@ -356,6 +460,8 @@
     const video = videoAt(pointer.x, pointer.y);
     if (video) {
       show(video);
+      // In fullscreen the pointer never leaves the video; hide when it rests.
+      if (document.fullscreenElement) scheduleHide();
     } else if (current) {
       scheduleHide();
     }
@@ -382,13 +488,40 @@
     }
   }
 
+  function onVideoResize(event) {
+    if (event.target === current) render();
+  }
+
   // A video that loads under a pointer that is not moving would otherwise
   // wait for the next mouse move; check the last known position again.
   function onVideoReady(event) {
-    if (enabled && pointer && event.target instanceof HTMLVideoElement && !checkScheduled) {
+    if (!enabled || !(event.target instanceof HTMLVideoElement)) return;
+    pinMainVideo();
+    if (pointer && !checkScheduled) {
       checkScheduled = true;
       requestAnimationFrame(checkPointer);
     }
+  }
+
+  function onFullscreenChange() {
+    place();
+    const action = DownpourRules.videoButtonOnFullscreen({
+      fullscreen: Boolean(document.fullscreenElement),
+      showing: Boolean(current),
+      onMainVideo: current !== null && current === pinned,
+    });
+    if (action === "hide-later") scheduleHide();
+    // Back on the page, the button stays on the main video again.
+    else if (action === "stay") clearTimeout(hideTimer);
+    else if (action === "show-main") showPinnedVideo();
+  }
+
+  // The background found new media in the tab: maybe this frame's stream,
+  // or the qualities of the one the button shows.
+  function onBackgroundMessage(message) {
+    if (message?.type !== "media-changed" || !enabled) return;
+    if (current) refreshChoices();
+    pinMainVideo();
   }
 
   // The manifest runs this script at document_start, so these listeners
@@ -399,8 +532,12 @@
   window.addEventListener("keydown", onKeyDown, { capture: true });
   document.addEventListener("play", onPlay, { capture: true });
   document.addEventListener("loadedmetadata", onVideoReady, { capture: true });
+  // A video's height is known once it loads and changes when the player
+  // switches quality; the label follows it.
+  document.addEventListener("resize", onVideoResize, { capture: true });
   document.addEventListener("playing", onVideoReady, { capture: true });
   window.addEventListener("scroll", place, { capture: true, passive: true });
   window.addEventListener("resize", place, { passive: true });
-  document.addEventListener("fullscreenchange", place);
+  document.addEventListener("fullscreenchange", onFullscreenChange);
+  browser.runtime.onMessage.addListener(onBackgroundMessage);
 })();

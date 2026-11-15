@@ -2,6 +2,7 @@ const fields = {
   form: document.getElementById("options"),
   capture: document.getElementById("capture"),
   videoButton: document.getElementById("video-button"),
+  localVideos: document.getElementById("local-videos"),
   handOffNotice: document.getElementById("handoff-notice"),
   types: document.getElementById("types"),
   size: document.getElementById("size"),
@@ -14,6 +15,7 @@ const fields = {
 function show(settings) {
   fields.capture.checked = settings.captureEnabled;
   fields.videoButton.checked = settings.videoButton !== false;
+  fields.localVideos.checked = settings.captureLocalVideos === true;
   fields.handOffNotice.checked = settings.handOffNotice !== false;
   fields.types.value = DownpourRules.parseList(settings.fileTypes).join(" ");
   fields.size.value = settings.minSizeKb;
@@ -25,6 +27,7 @@ function read() {
   return {
     captureEnabled: fields.capture.checked,
     videoButton: fields.videoButton.checked,
+    captureLocalVideos: fields.localVideos.checked,
     handOffNotice: fields.handOffNotice.checked,
     fileTypes: DownpourRules.parseList(fields.types.value).join(" "),
     minSizeKb: Number.isFinite(size) && size > 0 ? size : 0,

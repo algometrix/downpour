@@ -1,4 +1,5 @@
-//! Windows notifications when downloads finish or fail.
+//! Windows notifications: when downloads finish or fail, and one-off notices
+//! such as where the app went when its window closed.
 //!
 //! Notifications are shown from their own thread, so a slow or broken
 //! notification service never holds up the window. Failures are logged and
@@ -150,6 +151,32 @@ fn escape_xml(text: &str) -> String {
     escaped
 }
 
+/// Why a notice was not shown.
+#[derive(Debug, thiserror::Error)]
+pub enum NoticeError {
+    #[error("Windows notifications did not start")]
+    Unavailable,
+    #[error("the notification thread has stopped")]
+    Stopped,
+    #[error(transparent)]
+    NotShown(NotificationError),
+}
+
+/// The answer to one notice, which arrives once Windows has shown it or
+/// refused to.
+pub struct PendingNotice(mpsc::Receiver<Result<(), NotificationError>>);
+
+impl PendingNotice {
+    /// `None` while the answer is still on its way.
+    pub fn outcome(&self) -> Option<Result<(), NoticeError>> {
+        match self.0.try_recv() {
+            Ok(shown) => Some(shown.map_err(NoticeError::NotShown)),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err(NoticeError::Stopped)),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum NotificationError {
     #[error("start the notification thread: {0}")]
@@ -157,15 +184,28 @@ pub enum NotificationError {
     #[cfg(windows)]
     #[error("Windows notifications: {0}")]
     Windows(#[from] windows::core::Error),
+    #[cfg(not(windows))]
+    #[error("notifications are shown on Windows only")]
+    Unsupported,
 }
 
 /// Called when the user clicks a notification; runs on a Windows thread.
 pub type OnClick = Arc<dyn Fn() + Send + Sync>;
 
-/// Hands announcements to the notification thread, one frame's worth at a
-/// time, so they are shown (or summed up) together.
+/// What the notification thread is asked to show.
+enum Request {
+    /// One frame's announcements, shown (or summed up) together.
+    Announce(Vec<NotificationText>),
+    /// One notice; the thread answers whether Windows showed it.
+    Tell {
+        text: NotificationText,
+        reply: mpsc::Sender<Result<(), NotificationError>>,
+    },
+}
+
+/// Hands notifications to the notification thread.
 pub struct Notifier {
-    sender: mpsc::Sender<Vec<Announcement>>,
+    sender: mpsc::Sender<Request>,
 }
 
 impl Notifier {
@@ -182,12 +222,24 @@ impl Notifier {
         if batch.is_empty() {
             return;
         }
-        if let Err(unsent) = self.sender.send(batch) {
+        let texts = notifications_for(&batch);
+        let count = texts.len();
+        if self.sender.send(Request::Announce(texts)).is_err() {
             tracing::warn!(
-                count = unsent.0.len(),
+                count,
                 "the notification thread has stopped; notifications dropped"
             );
         }
+    }
+
+    /// Shows one notification that is not about a download; its answer comes
+    /// once Windows has shown it or refused to.
+    pub fn tell(&self, text: NotificationText) -> Result<PendingNotice, NoticeError> {
+        let (reply, answer) = mpsc::channel();
+        self.sender
+            .send(Request::Tell { text, reply })
+            .map_err(|_| NoticeError::Stopped)?;
+        Ok(PendingNotice(answer))
     }
 }
 
@@ -201,7 +253,7 @@ mod native {
     use windows::Foundation::TypedEventHandler;
     use windows::UI::Notifications::{ToastNotification, ToastNotificationManager, ToastNotifier};
 
-    use super::{notifications_for, toast_xml, Announcement, NotificationError, OnClick};
+    use super::{toast_xml, NotificationError, NotificationText, OnClick, Request};
     use crate::desktop::com::{Apartment, ComApartment};
 
     /// Notifications on screen keep their click handler only while their
@@ -210,8 +262,8 @@ mod native {
 
     /// Runs until the `Notifier` is dropped, then leaves COM after its
     /// objects are released.
-    pub fn run(receiver: &mpsc::Receiver<Vec<Announcement>>, on_click: &OnClick) {
-        // Declared first, so it drops last: after `kept` and `notifier`.
+    pub fn run(receiver: &mpsc::Receiver<Request>, on_click: &OnClick) {
+        // Declared first, so it drops last: after the toasts and their notifier.
         let _apartment = match ComApartment::enter(Apartment::MultiThreaded) {
             Ok(apartment) => apartment,
             Err(error) => {
@@ -219,24 +271,47 @@ mod native {
                 return;
             }
         };
-        let mut notifier: Option<ToastNotifier> = None;
-        let mut kept: VecDeque<ToastNotification> = VecDeque::new();
-        while let Ok(batch) = receiver.recv() {
-            for text in notifications_for(&batch) {
-                let shown = notifier_for(&mut notifier)
-                    .and_then(|notifier| show(notifier, &toast_xml(&text), on_click));
-                match shown {
-                    Ok(toast) => {
-                        if kept.len() == KEPT_NOTIFICATIONS {
-                            kept.pop_front();
+        let mut toasts = Toasts::default();
+        while let Ok(request) = receiver.recv() {
+            match request {
+                Request::Announce(batch) => {
+                    for text in batch {
+                        if let Err(error) = toasts.show(&text, on_click) {
+                            tracing::warn!(%error, title = %text.title, "could not show a Windows notification");
                         }
-                        kept.push_back(toast);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, title = %text.title, "could not show a Windows notification");
                     }
                 }
+                Request::Tell { text, reply } => {
+                    // The app may have stopped waiting; the answer is then not needed.
+                    let _ = reply.send(toasts.show(&text, on_click));
+                }
             }
+        }
+    }
+
+    /// The toasts shown so far, and the notifier that shows them.
+    #[derive(Default)]
+    struct Toasts {
+        notifier: Option<ToastNotifier>,
+        kept: VecDeque<ToastNotification>,
+    }
+
+    impl Toasts {
+        fn show(
+            &mut self,
+            text: &NotificationText,
+            on_click: &OnClick,
+        ) -> Result<(), NotificationError> {
+            let toast = show(
+                notifier_for(&mut self.notifier)?,
+                &toast_xml(text),
+                on_click,
+            )?;
+            if self.kept.len() == KEPT_NOTIFICATIONS {
+                self.kept.pop_front();
+            }
+            self.kept.push_back(toast);
+            Ok(())
         }
     }
 
@@ -276,14 +351,19 @@ mod native {
 mod native {
     use std::sync::mpsc;
 
-    use super::{Announcement, OnClick};
+    use super::{NotificationError, OnClick, Request};
 
-    pub fn run(receiver: &mpsc::Receiver<Vec<Announcement>>, _on_click: &OnClick) {
-        while let Ok(batch) = receiver.recv() {
-            tracing::debug!(
-                count = batch.len(),
-                "no desktop notifications on this platform"
-            );
+    pub fn run(receiver: &mpsc::Receiver<Request>, _on_click: &OnClick) {
+        while let Ok(request) = receiver.recv() {
+            match request {
+                Request::Announce(batch) => tracing::debug!(
+                    count = batch.len(),
+                    "no desktop notifications on this platform"
+                ),
+                Request::Tell { reply, .. } => {
+                    let _ = reply.send(Err(NotificationError::Unsupported));
+                }
+            }
         }
     }
 }

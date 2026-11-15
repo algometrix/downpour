@@ -23,13 +23,13 @@ use eframe::egui;
 
 use crate::app_settings::{AppSettings, DownloadNotifications};
 use crate::platform::MainWindow;
-use notifications::{AppFocus, Notifier};
+use notifications::{AppFocus, NotificationText, Notifier};
 use power::SleepBlocker;
 use taskbar::{ProgressTracker, TaskbarButton, TransferState};
 use title_bar::TitleBars;
 use window_messages::{SystemColors, WindowWatch};
 
-pub use notifications::{Announcement, OnClick, Outcome};
+pub use notifications::{Announcement, NoticeError, OnClick, Outcome, PendingNotice};
 pub use title_bar::TitleBarColors;
 
 /// How long downloads get to pause when Windows ends the session. Windows
@@ -133,6 +133,16 @@ impl Desktop {
         if *latest != *settings {
             latest.clone_from(settings);
         }
+    }
+
+    /// Shows a notification that is not about a download, whatever the
+    /// notification setting, which is about downloads.
+    pub fn tell(&self, title: &str, body: &str) -> Result<PendingNotice, NoticeError> {
+        let notifier = self.notifier.as_ref().ok_or(NoticeError::Unavailable)?;
+        notifier.tell(NotificationText {
+            title: title.to_owned(),
+            body: body.to_owned(),
+        })
     }
 
     /// Announces one frame's finished and failed downloads, when the setting

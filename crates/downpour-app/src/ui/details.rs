@@ -140,7 +140,7 @@ fn ring(ui: &mut Ui, download: &DownloadView) {
         color,
     );
     let headline = match fraction {
-        Some(fraction) => format!("{:.0}%", fraction * 100.0),
+        Some(fraction) => format::percent(fraction),
         None => format::bytes(download.received),
     };
     let caption = match download.size {
@@ -432,7 +432,7 @@ fn buttons(ui: &mut Ui, download: &DownloadView, actions: &mut Vec<Action>) {
                 actions.push(action);
             }
         }
-        if let (DownloadStatus::Completed, Some(target)) = (&download.status, &download.target) {
+        if let Some(file) = download.finished_file() {
             if button(
                 ui,
                 ButtonKind::Primary,
@@ -441,7 +441,7 @@ fn buttons(ui: &mut Ui, download: &DownloadView, actions: &mut Vec<Action>) {
             )
             .clicked()
             {
-                actions.push(Action::OpenFile(target.clone()));
+                actions.push(Action::OpenFile(file.to_path_buf()));
             }
         }
         let can_start_over = download.status.can_resume() && download.received > 0;
@@ -476,7 +476,7 @@ fn buttons(ui: &mut Ui, download: &DownloadView, actions: &mut Vec<Action>) {
         )
         .clicked()
         {
-            actions.push(Action::AskRemove(download.id));
+            actions.push(Action::AskRemove(vec![download.id]));
         }
     });
 }

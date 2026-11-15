@@ -72,7 +72,10 @@ async function buildItem(url, details = {}) {
     size: Number.isFinite(details.size) && details.size > 0 ? details.size : undefined,
     stream: details.format || undefined,
     quality: details.quality || undefined,
+    // A stream is named by `title`; a video file by `videoTitle`, which add-ons
+    // before it did not send, so an older app ignores it.
     title: details.title || undefined,
+    videoTitle: details.videoTitle || undefined,
     pageUrl: details.pageUrl || undefined,
     origin: details.origin || undefined,
     acceptLanguage: details.acceptLanguage || navigator.languages?.join(",") || undefined,
@@ -108,11 +111,18 @@ async function captureDownload(item) {
   eraseSoon(item.id);
 
   // The referrer is the page the download was started from; the app keeps
-  // it to find a fresh link when the first one expires.
+  // it to find a fresh link when the first one expires. The browser does not
+  // say which tab started it: the tab in front is the best guess, and counts
+  // only when it shows the referrer's site. A video is named after its title.
+  const [front] = await browser.tabs.query({ active: true, lastFocusedWindow: true }).catch((error) => {
+    console.warn("could not find the tab that started the download", error);
+    return [];
+  });
   const request = await buildItem(url, {
     fileName,
     referrer: item.referrer,
-    pageUrl: item.referrer,
+    pageUrl: DownpourRules.downloadPage(item.referrer, front?.url),
+    videoTitle: DownpourRules.startingPageTitle(front, item.referrer),
     mime: item.mime,
     size,
     cookieStoreId: item.cookieStoreId,
@@ -223,10 +233,14 @@ async function handOverResponse(details, download, sent) {
   // was sent; a navigation started by an add-on has no page.
   const startingPage = /^https?:/i.test(details.originUrl ?? "") ? details.originUrl : undefined;
   const referrer = sent.referer || startingPage;
+  // A main-frame download leaves the tab on the page that started it; a
+  // video is named after that page's title.
+  const tab = await pageOf(details.tabId);
   const request = await buildItem(details.url, {
     fileName: download.fileName,
     referrer,
-    pageUrl: referrer,
+    pageUrl: DownpourRules.downloadPage(referrer, startingPage || tab.url),
+    videoTitle: DownpourRules.startingPageTitle(tab, referrer),
     mime: download.mime,
     size: download.sizeBytes ?? undefined,
     origin: sent.origin,
@@ -440,13 +454,15 @@ function collectPageLinks() {
 async function onMenuClicked(info, tab) {
   const referrer = info.pageUrl || tab?.url;
   if (info.menuItemId === MENU.link && info.linkUrl) {
-    await sendDownloadsAnnounced([await buildItem(info.linkUrl, { referrer, pageUrl: referrer, title: tab?.title, cookieStoreId: tab?.cookieStoreId })], tab);
+    const title = DownpourRules.linkTitle(info.linkUrl, tab?.title);
+    await sendDownloadsAnnounced([await buildItem(info.linkUrl, { referrer, pageUrl: referrer, title, cookieStoreId: tab?.cookieStoreId })], tab);
   } else if (info.menuItemId === MENU.media && info.srcUrl) {
     // Streaming players play from a blob: URL; the real source is the
     // playlist detected in the tab.
     const isBlob = /^blob:/i.test(info.srcUrl);
     if (!isBlob) {
-      const details = { referrer, pageUrl: tab?.url, title: tab?.title, cookieStoreId: tab?.cookieStoreId };
+      const videoTitle = DownpourRules.videoTitle(tab?.title);
+      const details = { referrer, pageUrl: tab?.url, videoTitle, cookieStoreId: tab?.cookieStoreId };
       await sendDownloadsAnnounced([await buildItem(info.srcUrl, details)], tab);
       return;
     }
@@ -498,6 +514,7 @@ async function tabExists(tabId) {
 /**
  * Stores a tab's list and shows its count on the badge. Both happen inside
  * the ledger's queue, so the badge always matches the list last written.
+ * Then tells the tab's video buttons, best effort and outside that guarantee.
  */
 async function writeTabMedia(tabId, list) {
   if (list.length === 0) {
@@ -512,7 +529,25 @@ async function writeTabMedia(tabId, list) {
     if (await tabExists(tabId)) {
       throw error;
     }
+    return;
   }
+  tellVideoButtons(tabId);
+}
+
+// Pages where Firefox runs no content script (add-on pages, the new tab
+// page) have nobody to answer; that is expected.
+const NO_RECEIVER = "Receiving end does not exist";
+
+/**
+ * The video buttons in the tab's frames show the qualities and appear on
+ * the video as soon as its stream is found, without waiting for the mouse.
+ */
+function tellVideoButtons(tabId) {
+  browser.tabs.sendMessage(tabId, { type: "media-changed" }).catch((error) => {
+    if (!String(error?.message ?? error).includes(NO_RECEIVER)) {
+      console.warn("could not tell the video buttons about new media", error);
+    }
+  });
 }
 
 // Detections overlap (a player loads several playlists at once, and a
@@ -558,6 +593,12 @@ function takeSentHeaders(requestId) {
 
 // ---- Media and stream detection ----
 
+/** A video response the settings keep out of the list: it is from, or on a page of, this computer. */
+async function isIgnoredLocalVideo(details) {
+  const page = details.documentUrl || details.initiator || (await pageOf(details.tabId)).url;
+  return DownpourRules.isIgnoredLocalVideo(details.url, page, await loadSettings());
+}
+
 const PLAYLIST_FETCH_TIMEOUT_MS = 5_000;
 const MAX_PLAYLIST_CHARS = 2_000_000;
 
@@ -567,12 +608,17 @@ async function onHeadersReceived(details) {
   }
   const okay = details.statusCode === 200 || details.statusCode === 206;
   const format = okay ? DownpourRules.streamFormatOf(details.url, details.responseHeaders) : null;
+  const media = format ? null : DownpourRules.mediaFromResponse(details.responseHeaders, details.statusCode, details.url);
+  const isVideo = Boolean(format) || DownpourRules.isVideoMime(media?.mime);
+  if (isVideo && (await isIgnoredLocalVideo(details))) {
+    takeSentHeaders(details.requestId);
+    return;
+  }
   if (format) {
     await recordStream(details, format);
     return;
   }
   takeSentHeaders(details.requestId);
-  const media = DownpourRules.mediaFromResponse(details.responseHeaders, details.statusCode, details.url);
   if (!media) {
     return;
   }
@@ -585,6 +631,7 @@ async function onHeadersReceived(details) {
     size: media.sizeBytes,
     fileName: DownpourRules.fileNameFromUrl(details.url),
     referrer: details.documentUrl || details.initiator || undefined,
+    videoTitle: DownpourRules.videoTitle(page.title),
     pageUrl: page.url,
     frameId: details.frameId,
     cookieStoreId: details.cookieStoreId,
@@ -600,7 +647,11 @@ async function recordStream(details, format) {
   if (DownpourRules.isListedMedia(await mediaForTab(tabId), details.url)) {
     return;
   }
-  const playlist = await readPlaylist(details.url, details.cookieStoreId);
+  const playlist = await readPlaylist(details.url, {
+    cookieStoreId: details.cookieStoreId,
+    sentReferer: sent.referer,
+    origin: sent.origin,
+  });
   const page = await pageOf(tabId);
   await addTabMedia(ticket, {
     kind: "stream",
@@ -610,9 +661,11 @@ async function recordStream(details, format) {
     heights: playlist.heights,
     // Only a multivariant playlist's entries are other playlists to hide.
     variantUrls: playlist.kind === "multivariant" ? playlist.variantUrls : [],
-    title: page.title,
+    title: DownpourRules.videoTitle(page.title),
     pageUrl: page.url,
     referrer: sent.referer || details.documentUrl || details.initiator || page.url,
+    // Only what the page itself sent goes on our own reads of the playlist.
+    sentReferer: sent.referer,
     origin: sent.origin,
     acceptLanguage: sent.acceptLanguage,
     // Which frame's player loaded it, for the on-video Download button.
@@ -625,16 +678,61 @@ async function addTabMedia(ticket, entry) {
   await tabMedia.update(ticket, (list) => DownpourRules.withDetectedMedia(list, entry, MAX_MEDIA_PER_TAB));
 }
 
-/**
- * Best effort: a playlist that needs the page's Referer may refuse us. The
- * background page fetches with the normal window's cookies only, so a
- * playlist from a private window or container is not read; its stream is
- * still listed, without its qualities.
- */
-async function readPlaylist(url, cookieStoreId) {
-  if (!DownpourRules.isDefaultCookieStore(cookieStoreId)) {
-    return DownpourRules.describePlaylist("", url);
+// ---- Our own playlist reads ----
+// They carry the Referer and Origin the page sent. `onOwnPlaylistRequest`
+// finds a read's headers by address first, then keeps them by request id,
+// which Firefox keeps across redirects.
+const pageHeadersByUrl = new Map();
+const pageHeadersByRequest = new Map();
+const OUR_ORIGIN = browser.runtime.getURL("");
+
+function onOwnPlaylistRequest(details) {
+  if (!details.originUrl?.startsWith(OUR_ORIGIN)) {
+    return {};
   }
+  let page = pageHeadersByRequest.get(details.requestId);
+  if (!page) {
+    page = pageHeadersByUrl.get(details.url);
+    if (!page) {
+      return {};
+    }
+    pageHeadersByUrl.delete(details.url);
+    pageHeadersByRequest.set(details.requestId, page);
+  }
+  return { requestHeaders: DownpourRules.withPageHeaders(details.requestHeaders, page) };
+}
+
+function onOwnRequestDone(details) {
+  pageHeadersByRequest.delete(details.requestId);
+}
+
+// Reads by address; a second caller shares the read already running.
+const playlistReadsInFlight = new Map();
+
+/**
+ * Best effort: a server may still refuse us, and then the stream is listed
+ * without its qualities. The background page fetches with the normal
+ * window's cookies only, so a playlist from a private window or container
+ * is not read.
+ * @param {string} url the playlist's address
+ * @param {{cookieStoreId?: string, sentReferer?: string, origin?: string}} context what the page sent
+ */
+function readPlaylist(url, context) {
+  if (!DownpourRules.isDefaultCookieStore(context.cookieStoreId)) {
+    return Promise.resolve(DownpourRules.describePlaylist("", url));
+  }
+  const running = playlistReadsInFlight.get(url);
+  if (running) {
+    return running;
+  }
+  const read = fetchPlaylist(url, context).finally(() => playlistReadsInFlight.delete(url));
+  playlistReadsInFlight.set(url, read);
+  return read;
+}
+
+async function fetchPlaylist(url, context) {
+  const page = { sentReferer: context.sentReferer, origin: context.origin };
+  pageHeadersByUrl.set(url, page);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), PLAYLIST_FETCH_TIMEOUT_MS);
   try {
@@ -648,7 +746,57 @@ async function readPlaylist(url, cookieStoreId) {
     return DownpourRules.describePlaylist("", url);
   } finally {
     clearTimeout(timer);
+    // Left over when the request never reached the network.
+    pageHeadersByUrl.delete(url);
   }
+}
+
+// A refused or timed-out playlist is read again when a video button asks
+// for its qualities: twice at most per stream and page, 3 s apart, because
+// a server that keeps refusing will not change its mind on every hover.
+const rereadBudget = DownpourRules.createRereadBudget({ limit: 2, gapMs: 3_000, clock: Date.now });
+// A successful read of a playlist that is not in the tab's list has nowhere
+// else to live; without this every later ask would read it again.
+const unlistedPlaylists = DownpourRules.createPlaylistMemo();
+
+function forgetPlaylistReads(tabId) {
+  rereadBudget.forget(tabId);
+  unlistedPlaylists.forget(tabId);
+}
+
+/**
+ * Reads a stream's playlist again, so its qualities can still be listed.
+ * @param {number} tabId the tab it plays in
+ * @param {object} stream the stream, listed or taken from the video's address
+ * @param {string | undefined} cookieStoreId the tab's cookie store
+ */
+async function readPlaylistAgain(tabId, stream, cookieStoreId) {
+  if (!rereadBudget.take(tabId, stream.url)) {
+    return stream;
+  }
+  const ticket = tabMedia.begin(tabId);
+  const playlist = await readPlaylist(stream.url, {
+    cookieStoreId: stream.cookieStoreId ?? cookieStoreId,
+    sentReferer: stream.sentReferer,
+    origin: stream.origin,
+  });
+  if (playlist.kind === "unknown") {
+    return stream;
+  }
+  const list = await tabMedia.update(ticket, (current) => DownpourRules.withPlaylistRead(current, stream.url, playlist));
+  const listed = list?.find((entry) => entry.url === stream.url);
+  if (listed) {
+    return listed;
+  }
+  // Not listed (a video whose own address is the playlist), or unchanged.
+  if (!DownpourRules.isListedMedia(await mediaForTab(tabId), stream.url)) {
+    unlistedPlaylists.remember(tabId, stream.url, playlist);
+  }
+  return withPlaylist(stream, playlist);
+}
+
+function withPlaylist(stream, playlist) {
+  return { ...stream, playlistKind: playlist.kind, heights: playlist.heights };
 }
 
 async function pageOf(tabId) {
@@ -683,10 +831,41 @@ async function videoSourceFor(message, sender) {
   return DownpourRules.pickVideoSource(entries, { src: message.src, frameId: sender.frameId ?? 0 });
 }
 
-/** The on-video button's menu: the qualities the clicked video's stream offers. */
+/**
+ * The on-video button's menu: the qualities the video's stream offers.
+ * `detected` says the video's stream or file was seen loading in the
+ * sender's frame, so the button can stay on the video without a hover.
+ */
 async function videoQualities(message, sender) {
-  const source = await videoSourceFor(message, sender);
-  return { type: "qualities", choices: DownpourRules.videoQualityChoices(source?.heights) };
+  const tabId = sender.tab.id;
+  const video = { src: message.src, frameId: sender.frameId ?? 0 };
+  const entries = await mediaForTab(tabId);
+  let source = DownpourRules.pickVideoSource(entries, video);
+  // Left alone means no request to the local server either, not even for
+  // its playlist.
+  if (DownpourRules.isIgnoredLocalVideo(source?.url ?? message.src, sender.url, await loadSettings())) {
+    return { type: "qualities", detected: false, choices: [] };
+  }
+  const listed = Boolean(source) && DownpourRules.isListedMedia(entries, source.url);
+  if (listed) {
+    const unread = DownpourRules.streamToReread(entries, video.frameId);
+    if (unread) {
+      await readPlaylistAgain(tabId, unread, sender.tab.cookieStoreId);
+      source = DownpourRules.pickVideoSource(await mediaForTab(tabId), video);
+    }
+  } else if (DownpourRules.needsPlaylistRead(source)) {
+    const remembered = unlistedPlaylists.recall(tabId, source.url);
+    source = remembered ? withPlaylist(source, remembered) : await readPlaylistAgain(tabId, source, sender.tab.cookieStoreId);
+  }
+  const detected = DownpourRules.isDetectedInFrame(await mediaForTab(tabId), source, video.frameId);
+  return { type: "qualities", detected, choices: DownpourRules.videoQualityChoices(source?.heights) };
+}
+
+/** A stream is named by `title`, a video file by `videoTitle`; the page's title fills in. */
+function titlesFor(source, pageTitle) {
+  return source.kind === "stream"
+    ? { title: source.title || pageTitle, videoTitle: undefined }
+    : { title: undefined, videoTitle: source.videoTitle || pageTitle };
 }
 
 /** The on-video Download button: sends what the clicked video plays. */
@@ -703,15 +882,14 @@ async function downloadVideo(message, sender) {
     return { type: "error", message: "No video found yet. Play it for a moment, then try again." };
   }
   const page = await pageOf(sender.tab.id);
-  // A frame without its own address (about:blank) is not a usable referrer.
-  const frameUrl = /^https?:/i.test(sender.url ?? "") ? sender.url : page.url;
+  const frameUrl = DownpourRules.frameReferrer(sender.url, page.url);
   return sendDownloads([
     await buildItem(source.url, {
       ...source,
       // A plain video file has one quality; only streams have a choice.
       quality: source.kind === "stream" ? picked.quality : undefined,
       referrer: source.referrer || frameUrl,
-      title: source.title || page.title,
+      ...titlesFor(source, DownpourRules.videoTitle(page.title)),
       pageUrl: source.pageUrl || page.url,
       cookieStoreId: sender.tab.cookieStoreId,
     }),
@@ -814,6 +992,10 @@ browser.webRequest.onSendHeaders.addListener(
   { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other", ...PAGE_TYPES] },
   ["requestHeaders"],
 );
+const OWN_REQUESTS = { urls: ["http://*/*", "https://*/*"], tabId: -1 };
+browser.webRequest.onBeforeSendHeaders.addListener(onOwnPlaylistRequest, OWN_REQUESTS, ["blocking", "requestHeaders"]);
+browser.webRequest.onCompleted.addListener(onOwnRequestDone, OWN_REQUESTS);
+browser.webRequest.onErrorOccurred.addListener(onOwnRequestDone, OWN_REQUESTS);
 browser.webRequest.onHeadersReceived.addListener(
   onPageResponse,
   { urls: ["http://*/*", "https://*/*"], types: PAGE_TYPES },
@@ -828,10 +1010,12 @@ browser.webRequest.onHeadersReceived.addListener(
 );
 browser.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId === 0) {
+    forgetPlaylistReads(details.tabId);
     tabMedia.reset(details.tabId).catch((error) => console.warn("could not clear the tab's media", error));
   }
 });
 browser.tabs.onRemoved.addListener((tabId) => {
+  forgetPlaylistReads(tabId);
   tabMedia.reset(tabId).catch((error) => console.warn("could not clear the closed tab's media", error));
 });
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {

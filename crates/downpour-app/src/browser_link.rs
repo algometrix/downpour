@@ -7,11 +7,12 @@
 
 use std::path::PathBuf;
 
-use downpour_core::category::CategoryId;
+use downpour_core::category::{CategoryId, VIDEO_EXTENSIONS};
+use downpour_core::history::extension_of;
 use downpour_core::stream::{StreamFormat, VideoQuality};
 use downpour_core::{
-    Categories, DownloadKind, EngineSettings, FileName, FileNameSource, NewDownload, QueueId,
-    RequestContext, StartMode,
+    Categories, DownloadKind, EngineSettings, FileName, NewDownload, QueueId, RequestContext,
+    StartMode,
 };
 use downpour_protocol::messages::{BrowserDownload, QualityPick, StreamHint};
 use url::Url;
@@ -53,11 +54,6 @@ impl BrowserLink {
         self.item.size
     }
 
-    /// The file name the browser chose, if it chose one.
-    pub fn browser_file_name(&self) -> Option<&str> {
-        self.item.file_name.as_deref()
-    }
-
     pub fn url(&self) -> &Url {
         &self.url
     }
@@ -90,24 +86,77 @@ impl BrowserLink {
         }
     }
 
-    /// The name to offer: a stream is named after the page's title (a far
-    /// better name than `master.m3u8`), a file as the browser named it.
-    pub fn suggested_name(&self) -> String {
+    /// The name the link itself brings: a video is named after the page's
+    /// title (a far better name than `master.m3u8` or `v_1080_3f2a.mp4`),
+    /// another file as the browser named it, and a name someone typed beats
+    /// both. `None` leaves the name to the engine, and to the server.
+    pub fn carried_name(&self) -> Option<FileName> {
+        let typed = self.item.typed_name.as_deref();
+        if let Some(name) = typed.and_then(FileName::from_typed) {
+            return Some(name);
+        }
         match self.stream {
-            Some(_) => self
-                .item
-                .title
-                .as_deref()
-                .map(str::trim)
-                .filter(|title| !title.is_empty())
-                .map(|title| FileName::new(title, FileNameSource::Browser).value)
-                .unwrap_or_else(|| FileName::guess_for_stream(&self.url).value),
+            Some(_) => self.item.title.as_deref().and_then(FileName::from_browser),
             None => self
                 .item
-                .file_name
-                .clone()
-                .unwrap_or_else(|| FileName::guess_from_url(&self.url).value),
+                .video_title
+                .as_deref()
+                .zip(self.video_extension())
+                .and_then(|(title, extension)| titled_video(title, &extension))
+                .or_else(|| {
+                    self.item
+                        .file_name
+                        .as_deref()
+                        .and_then(FileName::from_browser)
+                }),
         }
+    }
+
+    /// The extension of the video file this link is, or `None` for any
+    /// other file. The first extension the browser's name or the address has
+    /// decides, so a `.zip` the browser named is never taken for a video
+    /// because its address ends in `.mp4`. The type says the rest: what a
+    /// file without an extension is, and whether a `.ts` is a video.
+    fn video_extension(&self) -> Option<String> {
+        let browser_name = self
+            .item
+            .file_name
+            .as_deref()
+            .and_then(FileName::from_browser);
+        let named = [browser_name, FileName::from_url_path(&self.url)]
+            .into_iter()
+            .flatten()
+            .map(|name| extension_of(&name.value))
+            .find(|extension| !extension.is_empty());
+        let typed = self.item.mime.as_deref().and_then(|mime| {
+            VIDEO_MIME_EXTENSIONS
+                .iter()
+                .find(|(known, _)| mime.eq_ignore_ascii_case(known))
+                .map(|(_, extension)| *extension)
+        });
+        match named {
+            Some(extension) if VIDEO_EXTENSIONS.contains(&extension.as_str()) => Some(extension),
+            Some(extension) => typed.filter(|typed| *typed == extension).map(str::to_owned),
+            None => typed.map(str::to_owned),
+        }
+    }
+
+    /// The name to offer in the file-info dialog.
+    pub fn suggested_name(&self) -> String {
+        self.carried_name()
+            .unwrap_or_else(|| match self.stream {
+                Some(_) => FileName::guess_for_stream(&self.url),
+                None => FileName::guess_from_url(&self.url),
+            })
+            .value
+    }
+
+    /// What to request given the dialog's name box: anything but the offered
+    /// name is the user's own, kept literally. An empty box means no opinion.
+    pub fn requested_name(&self, typed: &str) -> Option<FileName> {
+        FileName::from_typed(typed)
+            .filter(|name| name.value != self.suggested_name())
+            .or_else(|| self.carried_name())
     }
 
     /// The category a file named `name` falls in; streams become `.mp4`
@@ -118,6 +167,36 @@ impl BrowserLink {
             None => categories.classify(name),
         }
     }
+}
+
+/// The extension of a video served without one in its name.
+const VIDEO_MIME_EXTENSIONS: &[(&str, &str)] = &[
+    ("video/mp4", "mp4"),
+    ("video/webm", "webm"),
+    ("video/x-matroska", "mkv"),
+    ("video/quicktime", "mov"),
+    ("video/x-flv", "flv"),
+    // `.ts` alone may be TypeScript; the type says it is a video.
+    ("video/mp2t", "ts"),
+];
+
+/// `title.extension`, unless the title already ends in that extension: some
+/// pages are titled after the file itself.
+fn titled_video(title: &str, extension: &str) -> Option<FileName> {
+    let title = title.trim();
+    let suffix = format!(".{extension}");
+    let stem = title
+        .len()
+        .checked_sub(suffix.len())
+        .filter(|&cut| cut > 0 && title.is_char_boundary(cut))
+        .filter(|&cut| title[cut..].eq_ignore_ascii_case(&suffix))
+        .map_or(title, |cut| &title[..cut]);
+    let names_nothing = FileName::from_browser(stem).is_none();
+    if names_nothing {
+        // "" or "%20" would leave just ".mp4".
+        return None;
+    }
+    FileName::from_browser(&format!("{stem}{suffix}"))
 }
 
 /// Where a download of `category` is saved by default.
@@ -132,19 +211,17 @@ pub fn default_folder(settings: &EngineSettings, category: CategoryId) -> PathBu
     }
 }
 
-/// What the file-info dialog would add with its defaults untouched: the
-/// suggested name, the category's folder, the Main queue, and the quality
-/// picked on the page. Without a pick the engine applies the quality from
+/// What the file-info dialog would add with its defaults untouched: the name
+/// the link carries (or none, so the engine and server decide), the category's
+/// folder, the Main queue, and the quality picked on the page. Without a pick the engine applies the quality from
 /// Settings when the download starts.
 pub fn request_without_asking(link: BrowserLink, settings: &EngineSettings) -> NewDownload {
-    let name = link.suggested_name();
     // A name the server may still improve on stays unset.
-    let keep_name = link.stream.is_some() || link.item.file_name.is_some();
-    let file_name = keep_name.then(|| FileName::new(&name, FileNameSource::Browser));
-    // Without a name the engine picks the category folder once the server
-    // has named the file.
-    let folder = keep_name.then(|| {
-        let category = link.category_for(&name, &settings.categories);
+    let file_name = link.carried_name();
+    // Without a name the engine picks the category folder once the file has
+    // been named.
+    let folder = file_name.as_ref().map(|name| {
+        let category = link.category_for(&name.value, &settings.categories);
         downpour_core::paths::native(&default_folder(settings, category))
     });
     let kind = match link.stream {
@@ -169,11 +246,13 @@ pub fn request_without_asking(link: BrowserLink, settings: &EngineSettings) -> N
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use downpour_core::FileNameSource;
 
     pub fn item(url: &str) -> BrowserDownload {
         BrowserDownload {
             url: url.into(),
             file_name: None,
+            typed_name: None,
             referrer: None,
             cookies: None,
             user_agent: None,
@@ -182,6 +261,7 @@ pub mod tests {
             stream: None,
             quality: None,
             title: None,
+            video_title: None,
             page_url: None,
             origin: None,
             accept_language: None,
@@ -243,6 +323,100 @@ pub mod tests {
         })
         .unwrap();
         assert_eq!(local.page(), None);
+    }
+
+    fn video_on_page(url: &str, title: &str) -> BrowserDownload {
+        BrowserDownload {
+            video_title: Some(title.into()),
+            ..item(url)
+        }
+    }
+
+    #[test]
+    fn an_older_add_ons_page_title_never_names_a_file() {
+        // Its `title` named streams only, even when sent with a listed link.
+        let listed = BrowserLink::parse(BrowserDownload {
+            title: Some("Season 1".into()),
+            ..item("https://site.example/ep1.mp4")
+        })
+        .unwrap();
+        assert_eq!(listed.suggested_name(), "ep1.mp4");
+    }
+
+    #[test]
+    fn a_video_file_is_named_after_its_page() {
+        let named = |download| BrowserLink::parse(download).unwrap().suggested_name();
+        assert_eq!(
+            named(video_on_page(
+                "https://cdn.example/v_3f2a.mp4",
+                "Holiday: Rome"
+            )),
+            "Holiday_ Rome.mp4"
+        );
+        // The browser's name gives the extension when the address has none.
+        assert_eq!(
+            named(BrowserDownload {
+                file_name: Some("v_3f2a.webm".into()),
+                ..video_on_page("https://cdn.example/get?id=7", "Rome")
+            }),
+            "Rome.webm"
+        );
+        assert_eq!(
+            named(BrowserDownload {
+                mime: Some("video/mp4".into()),
+                ..video_on_page("https://cdn.example/get?id=7", "Rome")
+            }),
+            "Rome.mp4"
+        );
+        // An extensionless browser name leaves the extension to the address.
+        assert_eq!(
+            named(BrowserDownload {
+                file_name: Some("download".into()),
+                ..video_on_page("https://cdn.example/clip.mkv", "Rome")
+            }),
+            "Rome.mkv"
+        );
+        // A page titled after the file does not double the extension.
+        assert_eq!(
+            named(video_on_page("https://cdn.example/clip.MP4", "clip.mp4")),
+            "clip.mp4"
+        );
+    }
+
+    #[test]
+    fn other_files_and_empty_titles_keep_the_files_own_name() {
+        let named = |download| BrowserLink::parse(download).unwrap().suggested_name();
+        assert_eq!(
+            named(video_on_page("https://cdn.example/setup.exe", "Downloads")),
+            "setup.exe"
+        );
+        assert_eq!(
+            named(video_on_page("https://cdn.example/clip.mp4", "  ")),
+            "clip.mp4"
+        );
+        // `.ts` may be source code; only the type makes it a video.
+        assert_eq!(
+            named(video_on_page(
+                "https://code.example/app.ts",
+                "app.ts at main"
+            )),
+            "app.ts"
+        );
+        assert_eq!(
+            named(BrowserDownload {
+                mime: Some("video/mp2t".into()),
+                ..video_on_page("https://cdn.example/rome.ts", "Rome")
+            }),
+            "Rome.ts"
+        );
+        // The browser's own type wins over the address's.
+        assert_eq!(
+            named(BrowserDownload {
+                file_name: Some("pack.zip".into()),
+                ..video_on_page("https://cdn.example/clip.mp4", "Rome")
+            }),
+            "pack.zip"
+        );
     }
 
     #[test]
@@ -319,6 +493,30 @@ pub mod tests {
                 &PathBuf::from("D:/dl").join("Video")
             ))
         );
+        let escaped = BrowserLink::parse(BrowserDownload {
+            file_name: Some("My%20Movie.mp4".into()),
+            ..item("https://cdn.example/get?id=7")
+        })
+        .unwrap();
+        assert_eq!(escaped.suggested_name(), "My Movie.mp4");
+        let typed = BrowserLink::parse(BrowserDownload {
+            typed_name: Some("50%20off.mp4".into()),
+            file_name: Some("browser.mp4".into()),
+            ..item("https://cdn.example/get?id=7")
+        })
+        .unwrap();
+        let name = request_without_asking(typed, &settings).file_name.unwrap();
+        assert_eq!(name.value, "50%20off.mp4");
+        assert_eq!(name.source, FileNameSource::User);
+        // A name of nothing but escapes must not hide the URL's name, or
+        // stop the server from naming the file.
+        let blank = BrowserLink::parse(BrowserDownload {
+            file_name: Some("%20".into()),
+            ..item("https://cdn.example/clip.mp4")
+        })
+        .unwrap();
+        assert_eq!(blank.suggested_name(), "clip.mp4");
+        assert_eq!(request_without_asking(blank, &settings).file_name, None);
         // Without the browser's name, the server may still name the file,
         // and the engine picks its category folder then.
         let unnamed = request_without_asking(link("https://cdn.example/get?id=7"), &settings);

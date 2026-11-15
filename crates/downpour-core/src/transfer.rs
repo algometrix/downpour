@@ -24,7 +24,7 @@ use crate::category::Categories;
 use crate::disk::{self, is_disk_full, NoSpaceCheck};
 use crate::http::{self, Probe, ScopedContext, TransferError, TransferPlan, Validators};
 use crate::limiter::Throttle;
-use crate::naming::{first_free_path, FileName, FileNameSource};
+use crate::naming::{first_free_path, FileName};
 use crate::record::{part_path, Destination, DownloadId, DownloadSource, TransferProgress};
 use crate::segment::{SegmentLayoutError, SegmentTable, SlotId, SplitConfirmation};
 use crate::speed::SpeedMeter;
@@ -32,7 +32,8 @@ use crate::store::Store;
 use crate::stream::{self, VariantInfo};
 
 /// Segments are never split below this size; extra connections for smaller
-/// pieces cost more in handshakes than they save.
+/// pieces cost more in handshakes than they save. A slow last piece is handed
+/// over by a different rule (see `SegmentTable::assign_next`).
 const MIN_SPLIT_BYTES: u64 = 512 * 1024;
 const FLUSH_THRESHOLD_BYTES: usize = 512 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
@@ -60,6 +61,56 @@ pub struct TransferJob {
     pub categories: Categories,
     /// ffmpeg, found when the job started; streams need it to merge tracks.
     pub ffmpeg: Option<PathBuf>,
+    /// The name the user chose for the finished file, which can change while
+    /// the job runs.
+    pub final_name: FinalName,
+}
+
+/// The name a running transfer gives its file when it finishes, shared with
+/// the manager so the user can change it meanwhile. Finishing closes it: a
+/// name chosen after that is refused, never silently dropped.
+#[derive(Clone, Debug)]
+pub struct FinalName(Arc<Mutex<FinalNameState>>);
+
+#[derive(Debug)]
+enum FinalNameState {
+    /// The file is not finished; it takes this name then, or keeps its own.
+    Open(Option<FileName>),
+    Closed,
+}
+
+impl FinalName {
+    pub fn new(chosen: Option<FileName>) -> Self {
+        Self(Arc::new(Mutex::new(FinalNameState::Open(chosen))))
+    }
+
+    /// Sets the name the file gets when it finishes. Returns false once the
+    /// transfer has already finished its file.
+    pub fn choose(&self, name: FileName) -> bool {
+        let mut state = self.state();
+        match *state {
+            FinalNameState::Open(_) => {
+                *state = FinalNameState::Open(Some(name));
+                true
+            }
+            FinalNameState::Closed => false,
+        }
+    }
+
+    /// Ends the choice; returns the name chosen, if any.
+    pub(crate) fn close(&self) -> Option<FileName> {
+        match std::mem::replace(&mut *self.state(), FinalNameState::Closed) {
+            FinalNameState::Open(chosen) => chosen,
+            FinalNameState::Closed => None,
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, FinalNameState> {
+        // The state changes in one assignment; a panic cannot leave it half done.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// The services one transfer uses.
@@ -172,6 +223,13 @@ enum PrepareError {
     Transfer(#[from] TransferError),
     #[error("saved progress is inconsistent: {0}")]
     Layout(#[from] SegmentLayoutError),
+    /// The folder is carried because the server's name can move the download
+    /// to a different category's folder than the job's name would suggest.
+    #[error("could not save in {}: {error}", .directory.display())]
+    Saving {
+        error: TransferError,
+        directory: PathBuf,
+    },
     #[error("cancelled")]
     Cancelled,
 }
@@ -205,6 +263,9 @@ async fn run_file(
         Ok(Prepared::Segmented(run)) => run.drive(cancel, events).await,
         Ok(Prepared::Stream(run)) => run.drive(job, services, cancel, events).await,
         Err(PrepareError::Cancelled) => TransferOutcome::Stopped,
+        Err(PrepareError::Saving { error, directory }) => {
+            TransferOutcome::from_error(error, &directory)
+        }
         Err(PrepareError::Transfer(error)) => {
             let directory = match &job.target {
                 Some(target) => directory_of(target).to_path_buf(),
@@ -246,19 +307,23 @@ async fn prepare(
         _ = cancel.cancelled() => return Err(PrepareError::Cancelled),
         probe = http::probe(&services.client, &job.url, &job.context) => probe?,
     };
-    let file_name = match &probe.server_file_name {
-        Some(name) if job.file_name.is_replaceable_by_server() => {
-            FileName::new(name, FileNameSource::Server)
-        }
-        _ => job.file_name.clone(),
+    // A file already on disk keeps its name, so the list never shows one name
+    // for a file saved under another.
+    let file_name = match &job.target {
+        Some(_) => job.file_name.clone(),
+        None => job
+            .file_name
+            .after_response(probe.server_file_name.as_deref(), &probe.final_url),
     };
     let (target, part) = match &job.target {
         Some(target) => (target.clone(), recreate_part_file(target)?),
-        None => reserve_target(
-            &job.destination
-                .directory_for(&file_name.value, &job.categories),
-            &file_name.value,
-        )?,
+        None => {
+            let directory = job
+                .destination
+                .directory_for(&file_name.value, &job.categories);
+            reserve_target(&directory, &file_name.value)
+                .map_err(|error| PrepareError::Saving { error, directory })?
+        }
     };
 
     let Probe {
@@ -276,8 +341,20 @@ async fn prepare(
                 discard_reservation(&target);
                 return Err(error.into());
             }
-            part.set_len(size).map_err(TransferError::Disk)?;
+            if let Err(error) = part.set_len(size) {
+                drop(part);
+                // Only this run's reservation goes. Left behind, it would push
+                // the retry to `clip (1).mp4`.
+                if job.target.is_none() {
+                    discard_reservation(&target);
+                }
+                return Err(PrepareError::Saving {
+                    error: TransferError::Disk(error),
+                    directory: directory_of(&target).to_path_buf(),
+                });
+            }
             Prepared::Segmented(SegmentedRun {
+                final_name: job.final_name.clone(),
                 shared: Arc::new(Shared {
                     table: Mutex::new(SegmentTable::whole_file(size)),
                     part: Arc::new(part),
@@ -309,7 +386,7 @@ async fn prepare(
         },
     };
     events.send(TransferEvent::Connected {
-        file_name,
+        file_name: file_name.saved_as(&target),
         target,
         validators,
         progress,
@@ -342,6 +419,7 @@ fn reopen_segmented(
     };
     let table = SegmentTable::from_saved(*size, segments.clone())?;
     Ok(Some(SegmentedRun {
+        final_name: job.final_name.clone(),
         shared: Arc::new(Shared {
             table: Mutex::new(table),
             part: Arc::new(part),
@@ -364,7 +442,7 @@ fn reopen_segmented(
 pub(crate) fn reserve_target(dir: &Path, name: &str) -> Result<(PathBuf, File), TransferError> {
     std::fs::create_dir_all(dir)?;
     for _ in 0..MAX_NAME_RESERVATION_ATTEMPTS {
-        let target = first_free_path(dir, name, |path| path.exists() || part_path(path).exists());
+        let target = first_free_path(dir, name, |path| disk::is_name_taken(path, None));
         match OpenOptions::new()
             .read(true)
             .write(true)
@@ -406,18 +484,42 @@ fn recreate_part_file(target: &Path) -> Result<File, TransferError> {
         .open(part_path(target))?)
 }
 
-/// Moves the finished part file into place. If something else created the
-/// target meanwhile, the download gets the next free numbered name instead of
-/// overwriting it.
-pub(crate) fn finalize(target: &Path) -> Result<PathBuf, TransferError> {
+/// Moves the finished part file to its final name: the one the user chose
+/// while it downloaded, if any, otherwise `target`'s.
+pub(crate) fn finalize(target: &Path, final_name: &FinalName) -> Result<PathBuf, TransferError> {
+    finalize_as(target, final_name.close())
+}
+
+/// Moves the finished part file to `chosen`, or to `target`'s own name. A
+/// file or reservation already there is never replaced; the name is numbered
+/// (`clip (1).mp4`) like any duplicate download.
+pub(crate) fn finalize_as(
+    target: &Path,
+    chosen: Option<FileName>,
+) -> Result<PathBuf, TransferError> {
     let dir = target.parent().unwrap_or(Path::new("."));
-    let name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let destination = first_free_path(dir, &name, Path::exists);
-    std::fs::rename(part_path(target), &destination)?;
-    Ok(destination)
+    let name = match chosen {
+        Some(chosen) => chosen.value,
+        None => target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    for _ in 0..MAX_NAME_RESERVATION_ATTEMPTS {
+        let destination =
+            first_free_path(dir, &name, |path| disk::is_name_taken(path, Some(target)));
+        match disk::rename_without_replacing(&part_path(target), &destination) {
+            Ok(()) => return Ok(destination),
+            // Another file arrived there since the check; pick the next name.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no free file name for {name} in {}", dir.display()),
+    )
+    .into())
 }
 
 fn write_at(file: &File, mut offset: u64, mut bytes: &[u8]) -> io::Result<()> {
@@ -495,6 +597,7 @@ impl Shared {
 struct SegmentedRun {
     shared: Arc<Shared>,
     target: PathBuf,
+    final_name: FinalName,
     first_response: Option<Response>,
     max_connections: usize,
     server_limit: ServerConnectionLimit,
@@ -629,7 +732,7 @@ impl SegmentedRun {
         // Every worker has exited, so this drops the last handle to the part
         // file; Windows refuses to rename open files.
         drop(self.shared);
-        match finalize(&self.target) {
+        match finalize(&self.target, &self.final_name) {
             Ok(path) => TransferOutcome::Completed { path },
             Err(error) => TransferOutcome::from_error(error, directory_of(&self.target)),
         }
@@ -775,7 +878,9 @@ async fn receive_segment(
                 continue;
             }
         }
-        let accepted = shared.table().claim(slot, chunk.len() as u64) as usize;
+        let accepted = shared
+            .table()
+            .claim(slot, chunk.len() as u64, Instant::now()) as usize;
         shared.services.throttle.acquire(accepted as u64).await;
         pending.bytes.extend_from_slice(&chunk[..accepted]);
         if pending.bytes.len() >= FLUSH_THRESHOLD_BYTES {
@@ -841,7 +946,7 @@ impl StreamRun {
             );
         }
         drop(part);
-        match finalize(&self.target) {
+        match finalize(&self.target, &job.final_name) {
             Ok(path) => TransferOutcome::Completed { path },
             Err(error) => TransferOutcome::from_error(error, directory_of(&self.target)),
         }

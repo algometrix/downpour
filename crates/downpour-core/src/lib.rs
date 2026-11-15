@@ -25,8 +25,8 @@ pub mod units;
 pub use category::{Categories, Category, CategoryError, CategoryId, CategoryLook};
 pub use http::{RequestContext, ScopedContext};
 pub use manager::{
-    DownloadKind, DownloadManager, DownloadView, ManagerError, NewDownload, RemoveFiles, StartMode,
-    StreamView,
+    DownloadKind, DownloadManager, DownloadView, ManagerError, NewDownload, RemoveFiles,
+    RenameError, Renamed, StartMode, StreamView,
 };
 pub use naming::{FileName, FileNameSource};
 pub use ordering::QueuePlace;

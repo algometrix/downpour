@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use downpour_core::{
-    DownloadId, DownloadKind, DownloadManager, EngineSettings, FileName, FileNameSource,
-    NewDownload, QueueId, RemoveFiles, RequestContext, StartMode, Store,
+    DownloadId, DownloadKind, DownloadManager, EngineSettings, FileName, NewDownload, QueueId,
+    RemoveFiles, RequestContext, StartMode, Store,
 };
 use url::Url;
 
@@ -187,12 +187,7 @@ fn request_for(args: &GetArgs, url: Url) -> NewDownload {
     let request = &args.request;
     NewDownload {
         url,
-        file_name: args
-            .file_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(|name| FileName::new(name, FileNameSource::User)),
+        file_name: args.file_name.as_deref().and_then(FileName::from_typed),
         folder: None,
         context: RequestContext {
             referrer: request.referer.clone(),

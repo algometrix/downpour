@@ -29,8 +29,8 @@ use crate::naming::FileName;
 use crate::record::{part_path, track_path, TrackProgress, TransferProgress};
 use crate::speed::SpeedMeter;
 use crate::transfer::{
-    check_space, directory_of, finalize, reserve_target, write_at_blocking, Events, TransferEvent,
-    TransferJob, TransferOutcome, TransferServices,
+    check_space, directory_of, finalize_as, reserve_target, write_at_blocking, Events,
+    TransferEvent, TransferJob, TransferOutcome, TransferServices,
 };
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
@@ -187,7 +187,7 @@ async fn download_into(
     let (files, tracks) = open_tracks(plan, &job.progress, target)?;
     let mut status = RunStatus::new(tracks, events);
     events.send(TransferEvent::Connected {
-        file_name: job_file_name(job, target),
+        file_name: job.file_name.saved_as(target),
         target: target.to_path_buf(),
         validators: Validators::default(),
         progress: status.progress(),
@@ -216,17 +216,15 @@ async fn download_into(
     }
     events.send(TransferEvent::Merging);
     assemble(plan, output, job.ffmpeg.as_deref(), target, cancel).await?;
-    let path = finalize(target)?;
+    // A name chosen while the stream downloaded, before its file was
+    // reserved, has no container extension yet.
+    let chosen = job
+        .final_name
+        .close()
+        .map(|name| named_like_reserved(&name, target));
+    let path = finalize_as(target, chosen)?;
     forget_plan(services, job);
     Ok(path)
-}
-
-/// The name shown for the download: the reserved target's, once there is one.
-fn job_file_name(job: &TransferJob, target: &Path) -> FileName {
-    match target.file_name() {
-        Some(name) => FileName::new(&name.to_string_lossy(), job.file_name.source),
-        None => job.file_name.clone(),
-    }
 }
 
 impl StreamRunError {
@@ -304,8 +302,17 @@ fn forget_plan(services: &TransferServices, job: &TransferJob) {
     }
 }
 
+/// `name` for a stream whose file is reserved at `target`: its container
+/// chose the extension, so `Movie` becomes `Movie.mp4` next to `video.mp4`.
+pub(crate) fn named_like_reserved(name: &FileName, target: &Path) -> FileName {
+    match target.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => stream_file_name(name, extension),
+        None => name.clone(),
+    }
+}
+
 /// `"master.m3u8"` or `"Movie title"` becomes `"master.mp4"` or `"Movie title.mp4"`.
-fn stream_file_name(name: &FileName, extension: &str) -> FileName {
+pub(crate) fn stream_file_name(name: &FileName, extension: &str) -> FileName {
     let stem = match name.value.rsplit_once('.') {
         Some((stem, current))
             if !stem.is_empty()
@@ -807,7 +814,7 @@ mod tests {
 
     #[test]
     fn stream_names_get_the_output_extension() {
-        let from_url = FileName::new("master.m3u8", FileNameSource::Url);
+        let from_url = FileName::new("master.m3u8", FileNameSource::Guess);
         assert_eq!(stream_file_name(&from_url, "mp4").value, "master.mp4");
         let title = FileName::new("Scene 3 - Site.com", FileNameSource::Browser);
         assert_eq!(
@@ -816,5 +823,8 @@ mod tests {
         );
         let previous = FileName::new("clip.ts", FileNameSource::Browser);
         assert_eq!(stream_file_name(&previous, "mkv").value, "clip.mkv");
+        // A title at the length limit must not lose the extension added here.
+        let long_title = FileName::new(&"a".repeat(200), FileNameSource::Browser);
+        assert!(stream_file_name(&long_title, "mp4").value.ends_with(".mp4"));
     }
 }

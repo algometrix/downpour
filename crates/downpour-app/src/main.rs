@@ -170,12 +170,15 @@ fn run(data_dir: PathBuf, start: WindowStart) -> Result<(), StartupError> {
     let _ipc = ipc_server::start(&data_dir, Arc::clone(&inbox)).map_err(StartupError::Ipc)?;
 
     let size = settings.window_size.unwrap_or(WindowSize::DEFAULT);
+    let viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("Downpour")
+        .with_inner_size(size.points())
+        .with_min_inner_size(WindowSize::MINIMUM.points())
+        .with_icon(ui::icons::app_icon());
+    #[cfg(debug_assertions)]
+    let viewport = ui::screenshot::out_of_sight_when_reviewing(viewport);
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Downpour")
-            .with_inner_size(size.points())
-            .with_min_inner_size(WindowSize::MINIMUM.points())
-            .with_icon(ui::icons::app_icon()),
+        viewport,
         // eframe would save the window as it is at exit, and in the tray
         // that is minimized off-screen. The app remembers the size itself.
         persist_window: false,

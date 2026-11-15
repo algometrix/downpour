@@ -114,7 +114,7 @@ async fn a_server_ignoring_ranges_gives_the_size_and_the_url_names_the_file() {
         unreachable!("checked above");
     };
     assert_eq!(name.value, "plain.bin");
-    assert_eq!(name.source, FileNameSource::Url);
+    assert_eq!(name.source, FileNameSource::Guess);
 }
 
 #[tokio::test]
