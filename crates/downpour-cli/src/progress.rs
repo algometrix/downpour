@@ -86,6 +86,10 @@ mod tests {
         DownloadView {
             id: DownloadId(1),
             file_name: "big.iso".to_owned(),
+            rename: downpour_core::RenameParts {
+                stem: "big".to_owned(),
+                extension: downpour_core::RenameExtension::Kept(Some("iso".to_owned())),
+            },
             url: url::Url::parse("https://example.com/big.iso").unwrap(),
             page_url: None,
             referrer: None,

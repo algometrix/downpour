@@ -24,7 +24,7 @@ use crate::category::Categories;
 use crate::disk::{self, is_disk_full, NoSpaceCheck};
 use crate::http::{self, Probe, ScopedContext, TransferError, TransferPlan, Validators};
 use crate::limiter::Throttle;
-use crate::naming::{first_free_path, FileName};
+use crate::naming::{first_free_path, ChosenStem, FileName};
 use crate::record::{part_path, Destination, DownloadId, DownloadSource, TransferProgress};
 use crate::segment::{SegmentLayoutError, SegmentTable, SlotId, SplitConfirmation};
 use crate::speed::SpeedMeter;
@@ -74,31 +74,31 @@ pub struct FinalName(Arc<Mutex<FinalNameState>>);
 
 #[derive(Debug)]
 enum FinalNameState {
-    /// The file is not finished; it takes this name then, or keeps its own.
-    Open(Option<FileName>),
+    /// The file is not finished; it takes this stem then, or keeps its own.
+    Open(Option<ChosenStem>),
     Closed,
 }
 
 impl FinalName {
-    pub fn new(chosen: Option<FileName>) -> Self {
+    pub fn new(chosen: Option<ChosenStem>) -> Self {
         Self(Arc::new(Mutex::new(FinalNameState::Open(chosen))))
     }
 
-    /// Sets the name the file gets when it finishes. Returns false once the
+    /// Sets the stem the file gets when it finishes. Returns false once the
     /// transfer has already finished its file.
-    pub fn choose(&self, name: FileName) -> bool {
+    pub fn choose(&self, stem: ChosenStem) -> bool {
         let mut state = self.state();
         match *state {
             FinalNameState::Open(_) => {
-                *state = FinalNameState::Open(Some(name));
+                *state = FinalNameState::Open(Some(stem));
                 true
             }
             FinalNameState::Closed => false,
         }
     }
 
-    /// Ends the choice; returns the name chosen, if any.
-    pub(crate) fn close(&self) -> Option<FileName> {
+    /// Ends the choice; returns the stem chosen, if any.
+    pub(crate) fn close(&self) -> Option<ChosenStem> {
         match std::mem::replace(&mut *self.state(), FinalNameState::Closed) {
             FinalNameState::Open(chosen) => chosen,
             FinalNameState::Closed => None,
@@ -490,20 +490,22 @@ pub(crate) fn finalize(target: &Path, final_name: &FinalName) -> Result<PathBuf,
     finalize_as(target, final_name.close())
 }
 
-/// Moves the finished part file to `chosen`, or to `target`'s own name. A
-/// file or reservation already there is never replaced; the name is numbered
-/// (`clip (1).mp4`) like any duplicate download.
+/// Moves the finished part file to `target`'s name, with the `chosen` stem
+/// if any: `target` has the extension the server or the stream's container
+/// decided. A file or reservation already there is never replaced; the name
+/// is numbered (`clip (1).mp4`) like any duplicate download.
 pub(crate) fn finalize_as(
     target: &Path,
-    chosen: Option<FileName>,
+    chosen: Option<ChosenStem>,
 ) -> Result<PathBuf, TransferError> {
     let dir = target.parent().unwrap_or(Path::new("."));
+    let reserved = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let name = match chosen {
-        Some(chosen) => chosen.value,
-        None => target
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+        Some(stem) => stem.named_like(&reserved).value,
+        None => reserved,
     };
     for _ in 0..MAX_NAME_RESERVATION_ATTEMPTS {
         let destination =

@@ -216,13 +216,9 @@ async fn download_into(
     }
     events.send(TransferEvent::Merging);
     assemble(plan, output, job.ffmpeg.as_deref(), target, cancel).await?;
-    // A name chosen while the stream downloaded, before its file was
-    // reserved, has no container extension yet.
-    let chosen = job
-        .final_name
-        .close()
-        .map(|name| named_like_reserved(&name, target));
-    let path = finalize_as(target, chosen)?;
+    // A stem chosen while the stream downloaded takes the container's
+    // extension from `target`.
+    let path = finalize_as(target, job.final_name.close())?;
     forget_plan(services, job);
     Ok(path)
 }
@@ -299,15 +295,6 @@ fn forget_plan(services: &TransferServices, job: &TransferJob) {
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "could not delete the piece list")
         }
-    }
-}
-
-/// `name` for a stream whose file is reserved at `target`: its container
-/// chose the extension, so `Movie` becomes `Movie.mp4` next to `video.mp4`.
-pub(crate) fn named_like_reserved(name: &FileName, target: &Path) -> FileName {
-    match target.extension().and_then(|extension| extension.to_str()) {
-        Some(extension) => stream_file_name(name, extension),
-        None => name.clone(),
     }
 }
 

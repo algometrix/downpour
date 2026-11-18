@@ -7,6 +7,10 @@ pub fn view(id: u64) -> DownloadView {
     DownloadView {
         id: DownloadId(id),
         file_name: format!("file-{id}.zip"),
+        rename: downpour_core::RenameParts {
+            stem: format!("file-{id}"),
+            extension: downpour_core::RenameExtension::Kept(Some("zip".to_owned())),
+        },
         url: url::Url::parse("https://example.com/file.zip").unwrap(),
         page_url: None,
         referrer: None,

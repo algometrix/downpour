@@ -28,10 +28,10 @@ pub use manager::{
     DownloadKind, DownloadManager, DownloadView, ManagerError, NewDownload, RemoveFiles,
     RenameError, Renamed, StartMode, StreamView,
 };
-pub use naming::{FileName, FileNameSource};
+pub use naming::{ChosenStem, FileName, FileNameSource};
 pub use ordering::QueuePlace;
 pub use queue::{Queue, QueueError, QueueId, QueueState, Queues};
-pub use record::{DownloadId, DownloadRecord};
+pub use record::{DownloadId, DownloadRecord, RenameExtension, RenameParts};
 pub use settings::EngineSettings;
 pub use status::DownloadStatus;
 pub use store::{Store, StoreError};

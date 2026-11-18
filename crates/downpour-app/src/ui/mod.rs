@@ -908,7 +908,7 @@ impl App {
                     }
                 }
             }
-            DialogCommand::RenameFile { id, name } => match self.manager.rename_file(id, &name) {
+            DialogCommand::RenameFile { id, stem } => match self.manager.rename_file(id, &stem) {
                 Ok(Renamed::Now(renamed)) => {
                     self.dialog = None;
                     let shown = renamed

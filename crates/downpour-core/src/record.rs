@@ -6,7 +6,7 @@ use url::Url;
 use crate::category::Categories;
 use crate::http::{RequestContext, Validators};
 use crate::limiter::DownloadLimit;
-use crate::naming::FileName;
+use crate::naming::{ChosenStem, FileName, FileNameSource, NameParts};
 use crate::queue::QueueId;
 use crate::segment::Segment;
 use crate::status::DownloadStatus;
@@ -189,9 +189,40 @@ pub struct DownloadRecord {
     #[serde(default)]
     pub speed_limit: DownloadLimit,
     /// A name the user chose before the download finished. The transfer
-    /// keeps writing under `target`; the file takes this name once complete.
-    #[serde(default)]
-    pub name_when_finished: Option<FileName>,
+    /// keeps writing under `target`; once complete, the file takes this stem
+    /// with the extension it was saved with.
+    #[serde(
+        default,
+        alias = "name_when_finished",
+        deserialize_with = "stem_or_legacy_name"
+    )]
+    pub stem_when_finished: Option<ChosenStem>,
+}
+
+/// Lists saved before renames kept the extension hold a whole name, as
+/// `{"value": "Holiday.mp4", "source": "user"}`. Its stem is what the user
+/// chose; the extension comes from the file, as for any rename now.
+fn stem_or_legacy_name<'de, D>(deserializer: D) -> Result<Option<ChosenStem>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Saved {
+        Stem(ChosenStem),
+        LegacyName(FileName),
+        /// A pending rename lost is better than a list that will not load.
+        Unreadable(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Saved>::deserialize(deserializer)? {
+        None => None,
+        Some(Saved::Stem(stem)) => Some(stem),
+        Some(Saved::LegacyName(name)) => ChosenStem::from_typed(NameParts::of(&name.value).stem),
+        Some(Saved::Unreadable(_)) => {
+            tracing::warn!("a saved rename could not be read; the download keeps its name");
+            None
+        }
+    })
 }
 
 impl DownloadRecord {
@@ -200,9 +231,37 @@ impl DownloadRecord {
         finished_file(&self.status, self.target.as_deref())
     }
 
+    /// What a rename may change, and the extension the file keeps. The stem
+    /// is the one the user chose, if any, kept whole: a typed `.mkv` in it is
+    /// not taken for an extension.
+    pub fn rename_parts(&self) -> RenameParts {
+        let current = NameParts::of(&self.file_name.value);
+        let stem = match &self.stem_when_finished {
+            Some(stem) => stem.as_str().to_owned(),
+            None => current.stem.to_owned(),
+        };
+        // A reserved file has its extension. Before that, only a name the
+        // user, browser, or server gave is kept as it is (see
+        // `FileName::after_response`); a stream's container always decides.
+        let name_is_final = matches!(
+            self.file_name.source,
+            FileNameSource::User | FileNameSource::Browser | FileNameSource::Server
+        ) && !matches!(self.source, DownloadSource::Stream { .. });
+        let extension = if self.target.is_some() || name_is_final {
+            RenameExtension::Kept(current.extension.map(str::to_owned))
+        } else {
+            RenameExtension::DecidedOnSave
+        };
+        RenameParts { stem, extension }
+    }
+
     /// The name to show: the one the user chose, even before the file has it.
-    pub fn shown_name(&self) -> &FileName {
-        self.name_when_finished.as_ref().unwrap_or(&self.file_name)
+    /// Until the file is reserved its extension is the best guess so far.
+    pub fn shown_name(&self) -> FileName {
+        match &self.stem_when_finished {
+            Some(stem) => stem.named_like(&self.file_name.value),
+            None => self.file_name.clone(),
+        }
     }
 
     pub fn directory(&self, categories: &Categories) -> PathBuf {
@@ -213,6 +272,22 @@ impl DownloadRecord {
                 .directory_for(&self.file_name.value, categories),
         }
     }
+}
+
+/// What a rename changes: the stem. The extension stays the file's own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameParts {
+    pub stem: String,
+    pub extension: RenameExtension,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenameExtension {
+    /// The file keeps this extension (`mp4`), or has none.
+    Kept(Option<String>),
+    /// No file is reserved and the name so far is a guess: the server's name
+    /// or a stream's container decides the extension when the file is saved.
+    DecidedOnSave,
 }
 
 /// The in-progress file that becomes `target` when the download completes.
