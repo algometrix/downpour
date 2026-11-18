@@ -9,8 +9,8 @@ use downpour_core::stream::mux::locate_ffmpeg;
 use downpour_core::stream::{StreamError, StreamFormat, StreamOffer, VideoQuality};
 use downpour_core::{
     Categories, Category, CategoryId, CategoryLook, DownloadId, DownloadKind, DownloadStatus,
-    DownloadView, EngineSettings, NewDownload, Queue, QueueId, RemoveFiles, RequestContext,
-    StartMode,
+    DownloadView, EngineSettings, NewDownload, Queue, QueueId, RemoveFiles, RenameExtension,
+    RequestContext, StartMode,
 };
 use eframe::egui::{self, vec2, Align, Key, Layout, Ui};
 use url::Url;
@@ -82,7 +82,8 @@ pub enum DialogCommand {
     },
     RenameFile {
         id: DownloadId,
-        name: String,
+        /// The new name without its extension, which the file keeps.
+        stem: String,
     },
     RegisterBrowserIntegration,
     AddToFirefox,
@@ -315,7 +316,10 @@ impl RemoveForm {
 /// the download finishes.
 pub struct RenameFileForm {
     id: DownloadId,
-    name: String,
+    /// The name without its extension: a rename cannot change what kind of
+    /// file it is.
+    stem: String,
+    extension: RenameExtension,
     folder: String,
     finished: bool,
     pub error: Option<String>,
@@ -325,7 +329,8 @@ impl RenameFileForm {
     pub fn for_download(download: &DownloadView) -> Self {
         Self {
             id: download.id,
-            name: download.file_name.clone(),
+            stem: download.rename.stem.clone(),
+            extension: download.rename.extension.clone(),
             folder: download.directory.display().to_string(),
             finished: download.finished_file().is_some(),
             error: None,
@@ -1743,7 +1748,34 @@ fn rename_file(ui: &mut Ui, form: &mut RenameFileForm) -> Option<DialogCommand> 
     };
     title(ui, "Rename file", &subtitle);
     field_label(ui, "Name");
-    let name_field = text_field(ui, &mut form.name, "File name", None, ui.available_width());
+    let name_field = ui
+        .horizontal(|ui| {
+            let RenameExtension::Kept(Some(extension)) = &form.extension else {
+                return text_field(ui, &mut form.stem, "Name", None, ui.available_width());
+            };
+            // The extension is laid out first, so the field takes the rest.
+            let extension = egui::WidgetText::from(
+                egui::RichText::new(format!(".{extension}"))
+                    .font(theme::regular(14.0))
+                    .color(theme::ink_soft()),
+            )
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::FontSelection::Default,
+            );
+            let extension_room = extension.size().x + ui.spacing().item_spacing.x;
+            let field_width = (ui.available_width() - extension_room).max(0.0);
+            let field = text_field(ui, &mut form.stem, "Name", None, field_width);
+            ui.label(extension);
+            field
+        })
+        .inner;
+    if form.extension == RenameExtension::DecidedOnSave {
+        ui.add_space(4.0);
+        hint(ui, "The file keeps the extension it is saved with, which the download decides when it starts.");
+    }
     if ui.memory(|memory| memory.focused().is_none()) {
         name_field.request_focus();
     }
@@ -1755,7 +1787,7 @@ fn rename_file(ui: &mut Ui, form: &mut RenameFileForm) -> Option<DialogCommand> 
         if button(ui, ButtonKind::Primary, Some(Icon::Check), "Rename").clicked() || submitted {
             command = Some(DialogCommand::RenameFile {
                 id: form.id,
-                name: form.name.clone(),
+                stem: form.stem.clone(),
             });
         }
         if button(

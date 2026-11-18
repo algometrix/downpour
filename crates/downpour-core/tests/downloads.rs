@@ -9,6 +9,7 @@ use downpour_core::{
     DownloadManager, DownloadStatus, EngineSettings, FileName, FileNameSource, NewDownload,
     RenameError, Renamed, StartMode, Store,
 };
+use downpour_core::{RenameExtension, RenameParts};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use url::Url;
@@ -1279,7 +1280,7 @@ async fn a_finished_file_is_renamed_in_its_folder() {
     let (manager, view, _dir) = finished_download("rename").await;
     let before = view.target.clone().unwrap();
 
-    let Renamed::Now(renamed) = manager.rename_file(view.id, "Holiday clip.bin").unwrap() else {
+    let Renamed::Now(renamed) = manager.rename_file(view.id, "Holiday clip").unwrap() else {
         panic!("a finished file is renamed at once");
     };
 
@@ -1297,7 +1298,7 @@ async fn renaming_a_moved_file_says_where_it_was_expected() {
     let target = view.target.clone().unwrap();
     std::fs::remove_file(&target).unwrap();
 
-    let error = manager.rename_file(view.id, "new.bin").unwrap_err();
+    let error = manager.rename_file(view.id, "new").unwrap_err();
 
     assert!(matches!(&error, RenameError::FileMissing(path) if *path == target));
     assert!(error.to_string().contains("moved or deleted"), "{error}");
@@ -1314,7 +1315,7 @@ async fn renaming_never_replaces_another_file() {
     let other = target.with_file_name("other.bin");
     std::fs::write(&other, b"keep me").unwrap();
 
-    let error = manager.rename_file(view.id, "other.bin").unwrap_err();
+    let error = manager.rename_file(view.id, "other").unwrap_err();
 
     assert!(matches!(&error, RenameError::NameTaken(path) if *path == other));
     assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
@@ -1326,7 +1327,7 @@ async fn a_rename_takes_only_a_name() {
     let (manager, view, _dir) = finished_download("rename-name").await;
 
     assert!(matches!(
-        manager.rename_file(view.id, "sub/clip.bin"),
+        manager.rename_file(view.id, "sub/clip"),
         Err(RenameError::NameHasFolder)
     ));
     assert!(matches!(
@@ -1408,7 +1409,7 @@ async fn a_running_download_takes_its_new_name_when_finished() {
     } = running_download("rename-running").await;
 
     assert_eq!(
-        manager.rename_file(id, "Holiday clip.bin").unwrap(),
+        manager.rename_file(id, "Holiday clip").unwrap(),
         Renamed::WhenFinished("Holiday clip.bin".to_owned())
     );
     let running = manager.snapshot().into_iter().next().unwrap();
@@ -1437,7 +1438,7 @@ async fn a_download_not_started_yet_takes_its_new_name_when_finished() {
         .unwrap();
 
     assert_eq!(
-        manager.rename_file(id, "clip.bin").unwrap(),
+        manager.rename_file(id, "clip").unwrap(),
         Renamed::WhenFinished("clip.bin".to_owned())
     );
     manager.resume(id).unwrap();
@@ -1462,7 +1463,7 @@ async fn a_name_taken_before_the_download_finishes_is_refused() {
     let other = reserved.with_file_name("other.bin");
     std::fs::write(&other, b"keep me").unwrap();
 
-    let error = manager.rename_file(id, "other.bin").unwrap_err();
+    let error = manager.rename_file(id, "other").unwrap_err();
 
     assert!(matches!(&error, RenameError::NameTaken(path) if *path == other));
     let done = finish(&manager, id).await;
@@ -1478,7 +1479,7 @@ async fn a_name_taken_while_downloading_gets_a_number() {
         reserved,
         ..
     } = running_download("rename-taken-later").await;
-    manager.rename_file(id, "other.bin").unwrap();
+    manager.rename_file(id, "other").unwrap();
     let other = reserved.with_file_name("other.bin");
     std::fs::write(&other, b"keep me").unwrap();
 
@@ -1505,7 +1506,7 @@ async fn a_name_chosen_while_paused_survives_a_restart() {
         v.status == DownloadStatus::Paused
     })
     .await;
-    manager.rename_file(id, "kept.bin").unwrap();
+    manager.rename_file(id, "kept").unwrap();
     manager.shutdown(Duration::from_secs(5));
     drop(manager);
 
@@ -1553,37 +1554,68 @@ fn filing_manager(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_download_not_started_yet_is_saved_in_its_new_names_category() {
-    let server = serve(sample_body(1024), RangeSupport::Ranges).await;
-    let dir = temp_dir("rename-category");
-    let (manager, expected_folder) = filing_manager(&dir, Vec::new(), "clip.zip");
+async fn a_rename_keeps_the_files_extension() {
+    let (manager, view, _dir) = finished_download("rename-extension").await;
+    let before = view.target.clone().unwrap();
+
+    let Renamed::Now(renamed) = manager.rename_file(view.id, "clip.zip").unwrap() else {
+        panic!("a finished file is renamed at once");
+    };
+
+    // The typed ".zip" is part of the name; the file stays a ".bin".
+    assert_eq!(renamed, before.with_file_name("clip.zip.bin"));
+    assert!(renamed.is_file());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_chosen_before_the_server_answered_takes_the_servers_extension() {
+    let url =
+        serve_with_content_disposition("/files/get", r#"attachment; filename="report.zip""#).await;
+    let dir = temp_dir("rename-before-answer");
+    let (manager, expected_folder) = filing_manager(&dir, Vec::new(), "report.zip");
     let id = manager
-        .add(NewDownload::from_user(
-            server.url.clone(),
-            None,
-            None,
-            StartMode::Hold,
-        ))
+        .add(NewDownload::from_user(url, None, None, StartMode::Hold))
         .unwrap();
 
-    manager.rename_file(id, "clip.zip").unwrap();
+    // The URL names no extension yet; the server's name decides it. A typed
+    // ".mkv" stays in the stem, so renaming again unchanged keeps it.
+    manager.rename_file(id, "Quarterly.mkv").unwrap();
+    assert_eq!(
+        manager.snapshot()[0].rename,
+        RenameParts {
+            stem: "Quarterly.mkv".to_owned(),
+            extension: RenameExtension::DecidedOnSave,
+        }
+    );
+    assert_eq!(
+        manager.rename_file(id, "Quarterly").unwrap(),
+        Renamed::WhenFinished("Quarterly".to_owned())
+    );
     manager.resume(id).unwrap();
     let done = wait_for(&manager, Duration::from_secs(30), |v| {
         v.status == DownloadStatus::Completed
     })
     .await;
 
+    // Filed, too, by the server's name: the rename left the kind alone.
+    assert_eq!(done.file_name, "Quarterly.zip");
     assert_eq!(
-        done.target.as_deref(),
-        Some(expected_folder.join("clip.zip").as_path())
+        done.rename,
+        RenameParts {
+            stem: "Quarterly".to_owned(),
+            extension: RenameExtension::Kept(Some("zip".to_owned())),
+        }
     );
+    let target = done.target.unwrap();
+    assert_eq!(target, expected_folder.join("Quarterly.zip"));
+    assert_eq!(std::fs::read(&target).unwrap(), b"clip");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_name_chosen_before_the_file_was_reserved_files_it_by_that_name() {
+async fn a_whole_name_saved_by_an_older_version_keeps_the_files_extension() {
     let server = serve(sample_body(1024), RangeSupport::Ranges).await;
-    let dir = temp_dir("rename-before-reserved");
-    let (manager, _) = filing_manager(&dir, Vec::new(), "clip.zip");
+    let dir = temp_dir("rename-legacy");
+    let manager = manager_in(&dir, 1);
     manager
         .add(NewDownload::from_user(
             server.url.clone(),
@@ -1594,26 +1626,27 @@ async fn a_name_chosen_before_the_file_was_reserved_files_it_by_that_name() {
         .unwrap();
     manager.shutdown(Duration::from_secs(5));
     drop(manager);
-    // What renaming while the first run was still connecting leaves: the
-    // name waits for the finish, and no file was reserved.
-    let mut saved = Store::open(dir.join("state"))
+    // Older lists kept the whole typed name, extension and all.
+    let saved = Store::open(dir.join("state"))
         .unwrap()
         .load_downloads()
         .unwrap();
-    saved[0].name_when_finished = FileName::from_typed("clip.zip");
-    assert_eq!(saved[0].target, None);
+    let mut json = serde_json::to_value(&saved).unwrap();
+    json[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("stem_when_finished");
+    json[0]["name_when_finished"] = serde_json::json!({"value": "clip.zip", "source": "user"});
+    let saved: Vec<downpour_core::DownloadRecord> = serde_json::from_value(json).unwrap();
 
-    let (reopened, expected_folder) = filing_manager(&dir, saved, "clip.zip");
+    let reopened = manager_with_saved_list(&dir, 1, saved);
     reopened.resume(saved_id(&reopened)).unwrap();
     let done = wait_for(&reopened, Duration::from_secs(30), |v| {
         v.status == DownloadStatus::Completed
     })
     .await;
 
-    assert_eq!(
-        done.target.as_deref(),
-        Some(expected_folder.join("clip.zip").as_path())
-    );
+    assert_eq!(done.target.unwrap().file_name().unwrap(), "clip.bin");
 }
 
 fn saved_id(manager: &DownloadManager) -> downpour_core::DownloadId {
@@ -1632,7 +1665,7 @@ async fn a_name_another_download_reserved_is_refused() {
         .find(|view| view.id == second)
         .and_then(|view| view.target)
         .unwrap();
-    let taken = reserved_by_second.file_name().unwrap().to_string_lossy();
+    let taken = reserved_by_second.file_stem().unwrap().to_string_lossy();
 
     let error = manager.rename_file(first, &taken).unwrap_err();
 
@@ -1644,9 +1677,10 @@ async fn a_name_another_download_reserved_is_refused() {
 async fn changing_only_the_case_renames_the_file() {
     let (manager, view, _dir) = finished_download("rename-case").await;
     let target = view.target.clone().unwrap();
-    let upper = target.file_name().unwrap().to_string_lossy().to_uppercase();
+    let upper_stem = target.file_stem().unwrap().to_string_lossy().to_uppercase();
+    let extension = target.extension().unwrap().to_string_lossy();
 
-    let Renamed::Now(renamed) = manager.rename_file(view.id, &upper).unwrap() else {
+    let Renamed::Now(renamed) = manager.rename_file(view.id, &upper_stem).unwrap() else {
         panic!("a finished file is renamed at once");
     };
 
@@ -1654,7 +1688,7 @@ async fn changing_only_the_case_renames_the_file() {
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(listed, vec![upper]);
+    assert_eq!(listed, vec![format!("{upper_stem}.{extension}")]);
 }
 
 /// Queued downloads that never start: the queue is stopped and the address

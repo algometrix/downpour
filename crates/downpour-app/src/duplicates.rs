@@ -200,6 +200,10 @@ mod tests {
         DownloadView {
             id: DownloadId(id),
             file_name: format!("file-{id}.bin"),
+            rename: downpour_core::RenameParts {
+                stem: format!("file-{id}"),
+                extension: downpour_core::RenameExtension::Kept(Some("bin".to_owned())),
+            },
             url: Url::parse(url).unwrap(),
             page_url: None,
             referrer: None,

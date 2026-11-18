@@ -251,6 +251,82 @@ fn without_trailing_filler(name: &str) -> &str {
     name.trim_end_matches(|c: char| c == '.' || c.is_whitespace())
 }
 
+/// A file name split at its extension: `Holiday clip` and `mp4`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NameParts<'a> {
+    pub stem: &'a str,
+    /// `None` when nothing after a dot looks like an extension: `Mr. Smith
+    /// goes home` and `.gitignore` are all stem.
+    pub extension: Option<&'a str>,
+}
+
+impl<'a> NameParts<'a> {
+    /// Splits at the last dot when what follows is 1 to 16 letters or digits
+    /// and something comes before it; otherwise the whole name is the stem.
+    /// Shortening a name and renaming a file both keep this extension.
+    pub fn of(name: &'a str) -> Self {
+        let split = name.rsplit_once('.').filter(|(stem, extension)| {
+            !stem.is_empty()
+                && !extension.is_empty()
+                && extension.chars().count() <= MAX_EXTENSION_CHARS
+                && extension.chars().all(char::is_alphanumeric)
+        });
+        match split {
+            Some((stem, extension)) => Self {
+                stem,
+                extension: Some(extension),
+            },
+            None => Self {
+                stem: name,
+                extension: None,
+            },
+        }
+    }
+}
+
+/// A file name the user chose without its extension. A rename never changes
+/// the kind of file: the stem takes the extension of the file it names, and
+/// for an unfinished download that is only known once the file is reserved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ChosenStem(String);
+
+impl ChosenStem {
+    /// The stem someone typed, unless it cannot name a file: blank or only
+    /// dots. Characters a file name cannot hold are replaced, as for any
+    /// typed name; a typed `.mkv` stays part of the stem.
+    pub fn from_typed(raw: &str) -> Option<Self> {
+        usable_file_name(raw.trim()).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// `name` with this stem in place of its own, keeping its extension.
+    pub fn named_like(&self, name: &str) -> FileName {
+        let joined = match NameParts::of(name).extension {
+            Some(extension) => format!("{}.{extension}", self.0),
+            None => self.0.clone(),
+        };
+        FileName::new(&joined, FileNameSource::User)
+    }
+}
+
+impl TryFrom<String> for ChosenStem {
+    type Error = String;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::from_typed(&raw).ok_or_else(|| format!("{raw:?} cannot name a file"))
+    }
+}
+
+impl From<ChosenStem> for String {
+    fn from(stem: ChosenStem) -> Self {
+        stem.0
+    }
+}
+
 /// Tidies the end of a name and cuts it to `MAX_NAME_CHARS`, keeping its
 /// extension so the file still opens with the right program.
 fn shorten(name: &str) -> String {
@@ -258,12 +334,11 @@ fn shorten(name: &str) -> String {
     if name.chars().count() <= MAX_NAME_CHARS {
         return name.to_owned();
     }
-    let split = name.rsplit_once('.').filter(|(_, extension)| {
-        !extension.is_empty()
-            && extension.chars().count() <= MAX_EXTENSION_CHARS
-            && extension.chars().all(char::is_alphanumeric)
-    });
-    let Some((stem, extension)) = split else {
+    let NameParts {
+        stem,
+        extension: Some(extension),
+    } = NameParts::of(name)
+    else {
         let cut: String = name.chars().take(MAX_NAME_CHARS).collect();
         return without_trailing_filler(&cut).to_owned();
     };
@@ -599,6 +674,46 @@ mod tests {
             sanitize_file_name(&raw),
             format!("{}.mp4", "a".repeat(stem_chars - 3))
         );
+    }
+
+    #[test]
+    fn a_name_splits_at_its_extension() {
+        let parts = |name| {
+            let NameParts { stem, extension } = NameParts::of(name);
+            (stem, extension)
+        };
+        assert_eq!(parts("Holiday clip.mp4"), ("Holiday clip", Some("mp4")));
+        assert_eq!(parts("backup.tar.gz"), ("backup.tar", Some("gz")));
+        assert_eq!(parts("Mr. Smith goes home"), ("Mr. Smith goes home", None));
+        assert_eq!(parts(".gitignore"), (".gitignore", None));
+        assert_eq!(parts("readme"), ("readme", None));
+    }
+
+    #[test]
+    fn a_rename_keeps_the_extension() {
+        let renamed = |current, typed| {
+            ChosenStem::from_typed(typed).map(|stem| stem.named_like(current).value)
+        };
+        assert_eq!(renamed("clip.mp4", "Holiday"), Some("Holiday.mp4".into()));
+        // A typed extension is part of the stem; the file's own stays.
+        assert_eq!(
+            renamed("clip.mp4", "Holiday.mkv"),
+            Some("Holiday.mkv.mp4".into())
+        );
+        assert_eq!(
+            renamed("clip.mp4", " Holiday. "),
+            Some("Holiday.mp4".into())
+        );
+        assert_eq!(renamed("readme", "notes"), Some("notes".into()));
+        assert_eq!(renamed("clip.mp4", "  "), None);
+        assert_eq!(renamed("clip.mp4", "..."), None);
+    }
+
+    #[test]
+    fn a_saved_stem_is_checked_when_read() {
+        let stem: ChosenStem = serde_json::from_str(r#""Holiday""#).unwrap();
+        assert_eq!(serde_json::to_string(&stem).unwrap(), r#""Holiday""#);
+        assert!(serde_json::from_str::<ChosenStem>(r#""  ""#).is_err());
     }
 
     #[test]

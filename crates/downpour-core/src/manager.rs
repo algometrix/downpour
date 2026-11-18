@@ -23,11 +23,12 @@ use crate::history::CompletedDownload;
 use crate::http::{url_for_logs, RequestContext, Validators};
 use crate::limiter::{DownloadLimit, RateLimiter, Throttle};
 use crate::link_check::{self, CheckedLink};
-use crate::naming::{first_free_path, FileName};
+use crate::naming::{first_free_path, ChosenStem, FileName};
 use crate::ordering::{self, QueuePlace};
 use crate::queue::{Queue, QueueError, QueueId, QueueState, Queues};
 use crate::record::{
-    unfinished_files, Destination, DownloadId, DownloadRecord, DownloadSource, TransferProgress,
+    unfinished_files, Destination, DownloadId, DownloadRecord, DownloadSource, RenameParts,
+    TransferProgress,
 };
 use crate::segment::Segment;
 use crate::settings::EngineSettings;
@@ -150,6 +151,8 @@ pub enum Renamed {
 pub struct DownloadView {
     pub id: DownloadId,
     pub file_name: String,
+    /// What a rename may change, worked out from the record, not `file_name`.
+    pub rename: RenameParts,
     pub url: Url,
     pub page_url: Option<Url>,
     /// `Referer` the browser sent; the page for downloads captured before
@@ -462,7 +465,7 @@ impl DownloadManager {
                 // New downloads go to the end of the line.
                 position: state.last_position() + 1,
                 speed_limit: DownloadLimit::FollowSettings,
-                name_when_finished: None,
+                stem_when_finished: None,
             };
             tracing::info!(download = %id, url = %url_for_logs(&record.url), "download added");
             state.downloads.insert(
@@ -598,25 +601,25 @@ impl DownloadManager {
         Ok(())
     }
 
-    /// Renames a download's file in the folder it is saved to. A finished
-    /// file is renamed now; an unfinished one is saved under the name when
-    /// it finishes.
-    pub fn rename_file(&self, id: DownloadId, typed: &str) -> Result<Renamed, RenameError> {
-        if typed.contains(['/', '\\']) {
+    /// Renames a download's file in its folder to `typed_stem` plus the
+    /// extension the file has, so it still opens with the same program. A
+    /// finished file is renamed now. An unfinished one takes the name when it
+    /// finishes, with the extension it is saved with: the server or a
+    /// stream's container decides that, not a guess made before.
+    pub fn rename_file(&self, id: DownloadId, typed_stem: &str) -> Result<Renamed, RenameError> {
+        if typed_stem.contains(['/', '\\']) {
             return Err(RenameError::NameHasFolder);
         }
-        let name = FileName::from_typed(typed.trim())
-            .ok_or_else(|| RenameError::UnusableName(typed.to_owned()))?;
+        let stem = ChosenStem::from_typed(typed_stem)
+            .ok_or_else(|| RenameError::UnusableName(typed_stem.to_owned()))?;
         match self.saved_file(id)? {
             SavedFile::Finished(current) => {
+                let name =
+                    stem.named_like(&current.file_name().unwrap_or_default().to_string_lossy());
                 self.rename_finished(id, &current, &name).map(Renamed::Now)
             }
-            SavedFile::Reserved(reserved) => self.rename_reserved(id, &reserved, name),
-            SavedFile::ReservedStream(reserved) => {
-                let name = stream::download::named_like_reserved(&name, &reserved);
-                self.rename_reserved(id, &reserved, name)
-            }
-            SavedFile::NotReserved => self.rename_unfinished(id, name),
+            SavedFile::Reserved(reserved) => self.rename_reserved(id, &reserved, stem),
+            SavedFile::NotReserved => self.rename_unfinished(id, stem),
         }
     }
 
@@ -640,26 +643,25 @@ impl DownloadManager {
         Ok(renamed)
     }
 
-    /// Saves a download whose file is reserved as `name` when it finishes.
+    /// Saves a download whose file is reserved as `stem` when it finishes.
     fn rename_reserved(
         &self,
         id: DownloadId,
         reserved: &std::path::Path,
-        name: FileName,
+        stem: ChosenStem,
     ) -> Result<Renamed, RenameError> {
         // Checked now, so a clash shows while the user can pick again.
+        let name = stem.named_like(&reserved.file_name().unwrap_or_default().to_string_lossy());
         let renamed = folder_of(reserved).join(&name.value);
         if disk::is_name_taken(&renamed, Some(reserved)) {
             return Err(RenameError::NameTaken(renamed));
         }
-        self.rename_unfinished(id, name)
+        self.rename_unfinished(id, stem)
     }
 
-    /// Saves an unfinished download's file as `name` when it finishes. One
-    /// that has not reserved its file yet just takes the name, so it is also
-    /// saved in that name's category folder.
-    fn rename_unfinished(&self, id: DownloadId, name: FileName) -> Result<Renamed, RenameError> {
-        {
+    /// Saves an unfinished download's file under `stem` when it finishes.
+    fn rename_unfinished(&self, id: DownloadId, stem: ChosenStem) -> Result<Renamed, RenameError> {
+        let shown = {
             let mut state = self.state();
             let entry = state
                 .downloads
@@ -668,23 +670,17 @@ impl DownloadManager {
             if entry.record.finished_file().is_some() {
                 return Err(RenameError::JustFinished);
             }
-            match (&entry.live, &entry.record.target) {
-                (Some(live), _) => {
-                    if !live.final_name.choose(name.clone()) {
-                        return Err(RenameError::JustFinished);
-                    }
-                    entry.record.name_when_finished = Some(name.clone());
-                }
-                (None, Some(_)) => entry.record.name_when_finished = Some(name.clone()),
-                (None, None) => {
-                    entry.record.file_name = name.clone();
-                    entry.record.name_when_finished = None;
+            if let Some(live) = &entry.live {
+                if !live.final_name.choose(stem.clone()) {
+                    return Err(RenameError::JustFinished);
                 }
             }
-        }
+            entry.record.stem_when_finished = Some(stem);
+            entry.record.shown_name().value
+        };
         tracing::info!(download = %id, "the file gets its new name when the download finishes");
         self.changed_and_persist();
-        Ok(Renamed::WhenFinished(name.value))
+        Ok(Renamed::WhenFinished(shown))
     }
 
     /// Moves a finished file to `renamed` without replacing anything there,
@@ -747,10 +743,7 @@ impl DownloadManager {
             .record;
         Ok(match (record.finished_file(), &record.target) {
             (Some(file), _) => SavedFile::Finished(file.to_path_buf()),
-            (None, Some(reserved)) => match record.source {
-                DownloadSource::Stream { .. } => SavedFile::ReservedStream(reserved.clone()),
-                DownloadSource::File => SavedFile::Reserved(reserved.clone()),
-            },
+            (None, Some(reserved)) => SavedFile::Reserved(reserved.clone()),
             (None, None) => SavedFile::NotReserved,
         })
     }
@@ -1112,14 +1105,6 @@ impl DownloadManager {
     /// Starts the transfer of a queued download.
     fn launch(&self, entry: &mut Entry, settings: &EngineSettings) {
         transition(&mut entry.record, StatusEvent::Started);
-        // A name chosen while an earlier run was still connecting waits in
-        // `name_when_finished`. With no file reserved yet it simply becomes
-        // the name, so the file is reserved, and filed by category, under it.
-        if entry.record.target.is_none() {
-            if let Some(name) = entry.record.name_when_finished.take() {
-                entry.record.file_name = name;
-            }
-        }
         let record = &entry.record;
         let job = TransferJob {
             id: record.id,
@@ -1133,7 +1118,7 @@ impl DownloadManager {
             max_connections: usize::from(settings.connections_per_download),
             source: record.source.clone(),
             categories: settings.categories.clone(),
-            final_name: FinalName::new(record.name_when_finished.clone()),
+            final_name: FinalName::new(record.stem_when_finished.clone()),
             ffmpeg: match record.source {
                 DownloadSource::File => None,
                 DownloadSource::Stream { .. } => {
@@ -1243,11 +1228,8 @@ impl DownloadManager {
                     TransferOutcome::Completed { path } => {
                         // The transfer saved the file under the name chosen
                         // while it ran (see `FinalName`), perhaps numbered.
-                        let name = record
-                            .name_when_finished
-                            .take()
-                            .unwrap_or_else(|| record.file_name.clone());
-                        record.file_name = name.saved_as(&path);
+                        record.file_name = record.shown_name().saved_as(&path);
+                        record.stem_when_finished = None;
                         record.target = Some(path);
                         record.finished_at_unix = Some(unix_now());
                         transition(record, StatusEvent::Completed);
@@ -1478,11 +1460,10 @@ fn move_unfinished_files(target: &std::path::Path, name: &str) -> std::io::Resul
 /// A download's file as rename sees it.
 enum SavedFile {
     Finished(PathBuf),
-    /// The transfer writes under this name until the download finishes.
+    /// The transfer writes under this name until the download finishes. A
+    /// stream's container chose its extension.
     Reserved(PathBuf),
-    /// As `Reserved`, for a stream: its container chose the extension.
-    ReservedStream(PathBuf),
-    /// No transfer has chosen its file's name yet.
+    /// No transfer has chosen its file's name, or extension, yet.
     NotReserved,
 }
 
@@ -1574,7 +1555,8 @@ impl Entry {
         };
         DownloadView {
             id: record.id,
-            file_name: record.shown_name().value.clone(),
+            file_name: record.shown_name().value,
+            rename: record.rename_parts(),
             url: record.url.clone(),
             page_url: record.page_url.clone(),
             referrer: record.context.referrer.clone(),
