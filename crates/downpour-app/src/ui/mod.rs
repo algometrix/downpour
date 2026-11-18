@@ -154,6 +154,8 @@ pub enum Action {
     Select(Option<DownloadId>),
     /// A click on a row; the keys held decide how the selection changes.
     Pick(DownloadId, Pick),
+    /// Pick every row the list shows (Ctrl+A).
+    SelectAll,
     SetFilter(Filter),
     ShowStatistics,
     RefreshStatistics,
@@ -214,6 +216,8 @@ pub struct App {
     /// The rows the list shows this frame, in order: a Shift+click runs
     /// through these.
     shown_rows: Vec<DownloadId>,
+    /// A row a key moved to, for the list to scroll into view.
+    reveal: Option<DownloadId>,
     dialog: Option<Dialog>,
     pending_browser: VecDeque<Arrival>,
     /// The next link the browser sends replaces this download's address.
@@ -325,6 +329,7 @@ impl App {
             search: String::new(),
             selection: Selection::default(),
             shown_rows: Vec::new(),
+            reveal: None,
             dialog: None,
             pending_browser: VecDeque::new(),
             awaiting_refresh: None,
@@ -468,6 +473,10 @@ impl App {
             }
             Action::Pick(id, pick) => {
                 self.selection.pick(id, pick, &self.shown_rows);
+                Ok(())
+            }
+            Action::SelectAll => {
+                self.selection.select_all(&self.shown_rows);
                 Ok(())
             }
             Action::SetFilter(filter) => {
@@ -1144,7 +1153,7 @@ impl App {
         };
         let completed = |download: &&DownloadView| download.status == DownloadStatus::Completed;
 
-        commands
+        let actions: Vec<Action> = commands
             .into_iter()
             .filter_map(|command| match command {
                 Command::AddUrl => Some(Action::OpenAddUrl),
@@ -1167,15 +1176,21 @@ impl App {
                 Command::ClearCompleted => {
                     (on_list && visible.iter().any(completed)).then_some(Action::ClearCompleted)
                 }
-                Command::Next | Command::Previous if on_list => {
-                    let step = match command {
-                        Command::Next => list::Step::Next,
-                        _ => list::Step::Previous,
-                    };
-                    list::neighbor(visible, self.selection.focus(), step)
-                        .map(|download| Action::Select(Some(download.id)))
+                Command::Go(row, pick) if on_list => {
+                    let target = match row {
+                        hotkeys::Row::Next => {
+                            list::neighbor(visible, self.selection.focus(), list::Step::Next)
+                        }
+                        hotkeys::Row::Previous => {
+                            list::neighbor(visible, self.selection.focus(), list::Step::Previous)
+                        }
+                        hotkeys::Row::First => visible.first().copied(),
+                        hotkeys::Row::Last => visible.last().copied(),
+                    }?;
+                    Some(Action::Pick(target.id, pick))
                 }
-                Command::Next | Command::Previous => None,
+                Command::SelectAll if on_list => (!visible.is_empty()).then_some(Action::SelectAll),
+                Command::Go(..) | Command::SelectAll => None,
                 Command::Deselect => (!self.selection.is_empty()).then_some(Action::Select(None)),
                 Command::Primary => selected
                     .and_then(list::primary_row_action)
@@ -1186,9 +1201,8 @@ impl App {
                 Command::ShowInFolder => {
                     selected.map(|download| Action::Reveal(list::location(download)))
                 }
-                Command::CopyAddress => {
-                    selected.map(|download| Action::CopyText(download.url.to_string()))
-                }
+                Command::CopyAddress if on_list => list::copy_addresses(&shown),
+                Command::CopyAddress => None,
                 Command::Remove => (!picked.is_empty()).then(|| Action::AskRemove(picked.clone())),
                 Command::Rename => selected.map(|download| Action::AskRename(download.id)),
                 Command::MoveUp | Command::MoveDown => {
@@ -1205,7 +1219,13 @@ impl App {
                         .map(|place| Action::MoveInQueue(vec![download.id], place))
                 }
             })
-            .collect()
+            .collect();
+        // A key that moved to a row scrolls it into view.
+        self.reveal = actions.iter().rev().find_map(|action| match action {
+            Action::Pick(id, _) => Some(*id),
+            _ => None,
+        });
+        actions
     }
 
     /// The saved look, or the one being tried in Settings so the window
@@ -1329,7 +1349,7 @@ impl eframe::App for App {
         #[cfg(debug_assertions)]
         raw_input.events.append(&mut self.injected_input);
         if hotkeys::main_window_has_keyboard(ctx, self.dialog.is_some()) {
-            self.pending_hotkeys = hotkeys::take_pressed(raw_input);
+            self.pending_hotkeys = hotkeys::take_pressed(ctx, raw_input);
         }
     }
 
@@ -1459,6 +1479,7 @@ impl eframe::App for App {
                     stats::show(ui, &statistics, &live, intro, &mut actions)
                 }
                 None => {
+                    let reveal = self.reveal.take();
                     let state = list::ListState {
                         downloads: &downloads,
                         catalog: &catalog,
@@ -1467,6 +1488,7 @@ impl eframe::App for App {
                         selection: &self.selection,
                         order: self.settings.list_order,
                         visible: &visible,
+                        reveal,
                     };
                     list::show(ui, state, &mut actions);
                 }

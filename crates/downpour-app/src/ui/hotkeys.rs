@@ -11,11 +11,15 @@
 
 use eframe::egui::{self, Key, Modifiers};
 
-/// Whether a shortcut is a bare key or needs Ctrl (⌘ on macOS).
+use super::selection::Pick;
+
+/// Whether a shortcut is a bare key or needs Ctrl (⌘ on macOS) or Shift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Chord {
     Plain,
     Command,
+    /// Shift alone; in the list it extends the selection, as in Explorer.
+    Shift,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,12 +47,21 @@ impl Hotkey {
         }
     }
 
+    const fn shift(key: Key, name: &'static str) -> Self {
+        Self {
+            key,
+            chord: Chord::Shift,
+            name,
+        }
+    }
+
     /// The keys as written on screen, e.g. "N" or "Ctrl+F".
     pub fn keys(self) -> String {
         match self.chord {
             Chord::Plain => self.name.to_owned(),
             Chord::Command if cfg!(target_os = "macos") => format!("⌘{}", self.name),
             Chord::Command => format!("Ctrl+{}", self.name),
+            Chord::Shift => format!("Shift+{}", self.name),
         }
     }
 
@@ -61,6 +74,9 @@ impl Hotkey {
         let chord_held = match self.chord {
             Chord::Plain => modifiers.is_none(),
             Chord::Command => modifiers.command_only(),
+            Chord::Shift => {
+                modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.command
+            }
         };
         self.key == key && chord_held
     }
@@ -70,6 +86,7 @@ impl Hotkey {
         let modifiers = match self.chord {
             Chord::Plain => Modifiers::NONE,
             Chord::Command => Modifiers::COMMAND,
+            Chord::Shift => Modifiers::SHIFT,
         };
         ctx.input_mut(|input| input.consume_key(modifiers, self.key))
     }
@@ -98,6 +115,15 @@ pub const RENAME: Hotkey = Hotkey::plain(Key::F2, "F2");
 pub const NEXT: Hotkey = Hotkey::plain(Key::ArrowDown, "↓");
 pub const PREVIOUS: Hotkey = Hotkey::plain(Key::ArrowUp, "↑");
 pub const DESELECT: Hotkey = Hotkey::plain(Key::Escape, "Esc");
+pub const SELECT_ALL: Hotkey = Hotkey::command(Key::A, "A");
+/// Shift with an arrow, Home, or End picks the run from the last click to
+/// the row the key moves to.
+pub const EXTEND_NEXT: Hotkey = Hotkey::shift(Key::ArrowDown, "↓");
+pub const EXTEND_PREVIOUS: Hotkey = Hotkey::shift(Key::ArrowUp, "↑");
+pub const FIRST: Hotkey = Hotkey::plain(Key::Home, "Home");
+pub const LAST: Hotkey = Hotkey::plain(Key::End, "End");
+pub const EXTEND_FIRST: Hotkey = Hotkey::shift(Key::Home, "Home");
+pub const EXTEND_LAST: Hotkey = Hotkey::shift(Key::End, "End");
 /// Move the selected download one place earlier or later in its queue.
 pub const MOVE_UP: Hotkey = Hotkey::command(Key::ArrowUp, "↑");
 pub const MOVE_DOWN: Hotkey = Hotkey::command(Key::ArrowDown, "↓");
@@ -131,14 +157,24 @@ pub enum Command {
     CopyAddress,
     Remove,
     Rename,
-    Next,
-    Previous,
     Deselect,
+    SelectAll,
+    /// Go to a row: alone, or with the run from the anchor (Shift).
+    Go(Row, Pick),
     MoveUp,
     MoveDown,
 }
 
-const BINDINGS: [(Hotkey, Command); 19] = [
+/// The row a key goes to in the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Row {
+    Next,
+    Previous,
+    First,
+    Last,
+}
+
+const BINDINGS: [(Hotkey, Command); 26] = [
     (ADD_URL, Command::AddUrl),
     (ADD_LINKS, Command::AddLinks),
     (PAUSE_ALL, Command::PauseAll),
@@ -153,9 +189,16 @@ const BINDINGS: [(Hotkey, Command); 19] = [
     (COPY_ADDRESS, Command::CopyAddress),
     (REMOVE, Command::Remove),
     (RENAME, Command::Rename),
-    (NEXT, Command::Next),
-    (PREVIOUS, Command::Previous),
+    (NEXT, Command::Go(Row::Next, Pick::Only)),
+    (PREVIOUS, Command::Go(Row::Previous, Pick::Only)),
     (DESELECT, Command::Deselect),
+    (SELECT_ALL, Command::SelectAll),
+    (EXTEND_NEXT, Command::Go(Row::Next, Pick::Range)),
+    (EXTEND_PREVIOUS, Command::Go(Row::Previous, Pick::Range)),
+    (FIRST, Command::Go(Row::First, Pick::Only)),
+    (LAST, Command::Go(Row::Last, Pick::Only)),
+    (EXTEND_FIRST, Command::Go(Row::First, Pick::Range)),
+    (EXTEND_LAST, Command::Go(Row::Last, Pick::Range)),
     (MOVE_UP, Command::MoveUp),
     (MOVE_DOWN, Command::MoveDown),
 ];
@@ -166,10 +209,41 @@ pub fn main_window_has_keyboard(ctx: &egui::Context, dialog_open: bool) -> bool 
     !dialog_open && !ctx.wants_keyboard_input() && !ctx.memory(|memory| memory.any_popup_open())
 }
 
+/// Whether text in a label is selected, as by dragging across an address
+/// in the details panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LabelText {
+    Selected,
+    NotSelected,
+}
+
+/// What the copy event (Ctrl+C, Ctrl+Insert) does: selected label text owns
+/// it, as everywhere else; otherwise it copies the picked addresses.
+fn copy_command(label_text: LabelText) -> Option<Command> {
+    match label_text {
+        LabelText::Selected => None,
+        LabelText::NotSelected => Some(Command::CopyAddress),
+    }
+}
+
 /// Removes this frame's shortcut presses from `raw` and returns them.
-pub fn take_pressed(raw: &mut egui::RawInput) -> Vec<Command> {
+pub fn take_pressed(ctx: &egui::Context, raw: &mut egui::RawInput) -> Vec<Command> {
+    let label_text = if egui::text_selection::LabelSelectionState::load(ctx).has_selection() {
+        LabelText::Selected
+    } else {
+        LabelText::NotSelected
+    };
     let mut commands = Vec::new();
     raw.events.retain(|event| {
+        // The window turns Ctrl+C into a copy event instead of a key press,
+        // so the copy shortcut is that event.
+        if matches!(event, egui::Event::Copy) {
+            let Some(command) = copy_command(label_text) else {
+                return true;
+            };
+            commands.push(command);
+            return false;
+        }
         let egui::Event::Key {
             key,
             pressed: true,
@@ -179,18 +253,23 @@ pub fn take_pressed(raw: &mut egui::RawInput) -> Vec<Command> {
         else {
             return true;
         };
-        match BINDINGS
-            .iter()
-            .find(|(hotkey, _)| hotkey.matches(*key, *modifiers))
-        {
-            Some((_, command)) => {
-                commands.push(*command);
+        match command_for(*key, *modifiers) {
+            Some(command) => {
+                commands.push(command);
                 false
             }
             None => true,
         }
     });
     commands
+}
+
+/// The command a key press with these modifiers is bound to.
+fn command_for(key: Key, modifiers: Modifiers) -> Option<Command> {
+    BINDINGS
+        .iter()
+        .find(|(hotkey, _)| hotkey.matches(key, modifiers))
+        .map(|(_, command)| *command)
 }
 
 const FOCUS_SEARCH: &str = "downpour-focus-search";
@@ -216,6 +295,55 @@ mod tests {
         assert_eq!(ADD_URL.label("Add URL"), "Add URL (N)");
         let search = SEARCH.keys();
         assert!(search == "Ctrl+F" || search == "⌘F");
+    }
+
+    #[test]
+    fn shift_and_ctrl_pick_their_own_commands() {
+        let shift = Modifiers::SHIFT;
+        let go = |row, pick| Some(Command::Go(row, pick));
+        assert_eq!(
+            command_for(Key::ArrowDown, Modifiers::NONE),
+            go(Row::Next, Pick::Only)
+        );
+        assert_eq!(
+            command_for(Key::ArrowDown, shift),
+            go(Row::Next, Pick::Range)
+        );
+        assert_eq!(
+            command_for(Key::ArrowDown, Modifiers::COMMAND),
+            Some(Command::MoveDown)
+        );
+        assert_eq!(command_for(Key::End, shift), go(Row::Last, Pick::Range));
+        assert_eq!(
+            command_for(Key::A, Modifiers::COMMAND),
+            Some(Command::SelectAll)
+        );
+        // Ctrl+Shift is no binding of its own.
+        assert_eq!(
+            command_for(Key::ArrowDown, Modifiers::COMMAND | shift),
+            None
+        );
+        assert_eq!(EXTEND_LAST.keys(), "Shift+End");
+    }
+
+    #[test]
+    fn the_copy_event_copies_the_address() {
+        let mut raw = egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        assert_eq!(take_pressed(&ctx, &mut raw), [Command::CopyAddress]);
+        assert!(raw.events.is_empty());
+    }
+
+    #[test]
+    fn selected_label_text_keeps_the_copy_event() {
+        assert_eq!(copy_command(LabelText::Selected), None);
+        assert_eq!(
+            copy_command(LabelText::NotSelected),
+            Some(Command::CopyAddress)
+        );
     }
 
     #[test]

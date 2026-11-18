@@ -230,6 +230,10 @@ struct Inner {
     /// snapshot can never land after a newer one: the final save at exit
     /// would otherwise lose downloads added since a background save began.
     save_turn: Mutex<()>,
+    /// Set by `shutdown` after its final save, under `save_turn`. Saves that
+    /// were still under way then find it set and write nothing, so the final
+    /// list stays the last word even if another manager opens the same store.
+    closed: AtomicBool,
     listener: Mutex<Option<ChangeListener>>,
 }
 
@@ -384,6 +388,7 @@ impl DownloadManager {
                 dirty: AtomicBool::new(unsaved),
                 persist_now: Notify::new(),
                 save_turn: Mutex::new(()),
+                closed: AtomicBool::new(false),
                 listener: Mutex::new(None),
             }),
         };
@@ -1039,9 +1044,15 @@ impl DownloadManager {
         {
             std::thread::sleep(Duration::from_millis(50));
         }
-        if let Err(error) = self.save_records() {
+        let _turn = self
+            .inner
+            .save_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(error) = self.inner.store.save_downloads(&self.records()) {
             tracing::error!(%error, "final save failed");
         }
+        self.inner.closed.store(true, Ordering::Release);
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -1357,6 +1368,10 @@ impl DownloadManager {
             .save_turn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // After shutdown its final save is the last word: write nothing.
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.inner.store.save_downloads(&self.records())
     }
 

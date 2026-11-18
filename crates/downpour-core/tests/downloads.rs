@@ -1721,3 +1721,21 @@ async fn moving_to_a_queue_moves_all_or_none() {
     let queues: Vec<_> = manager.snapshot().iter().map(|view| view.queue).collect();
     assert_eq!(queues, [later, later]);
 }
+
+/// A manager that shut down writes nothing more: another one may own the
+/// list by then, as when the app restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manager_saves_nothing_after_shutdown() {
+    let dir = temp_dir("closed");
+    let manager = manager_in(&dir, 1);
+    held_downloads(&manager, &["a.bin"]);
+    manager.shutdown(Duration::from_secs(5));
+
+    // Someone else's list now, then a change that would have been saved.
+    let store = Store::open(dir.join("state")).unwrap();
+    store.save_downloads(&[]).unwrap();
+    held_downloads(&manager, &["b.bin"]);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(store.load_downloads().unwrap().is_empty());
+}
