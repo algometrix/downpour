@@ -326,7 +326,7 @@ impl Default for AppSettings {
             appearance: Appearance::MatchSystem,
             color_theme: ColorTheme::default(),
             on_close: CloseAction::HideToTray,
-            on_minimize: MinimizeAction::HideToTray,
+            on_minimize: MinimizeAction::Taskbar,
             sign_in_start: SignInStart::Manual,
             notifications: DownloadNotifications::Show,
             sleep: SleepWhileDownloading::KeepAwake,

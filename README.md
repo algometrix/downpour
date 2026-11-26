@@ -101,7 +101,7 @@
   <tr>
     <td colspan="2" valign="top">
 
-**🪟 Made for Windows**: per-user install with no admin rights • Start menu and desktop shortcuts • Settings > Apps entry • tray icon • Start with Windows • native notifications • progress on the taskbar button • keeps the PC awake while downloading • saves safely on shutdown • sharp on high-DPI screens • dark title bar
+**🪟 Made for Windows**: per-user install with no admin rights • Start menu and desktop shortcuts • Settings > Apps entry • tray icon (minimizing keeps the window on the taskbar; closing it hides to the tray and downloads keep running; both can be changed in Settings) • Start with Windows • native notifications • progress on the taskbar button • keeps the PC awake while downloading • saves safely on shutdown • sharp on high-DPI screens • dark title bar
 
 </td>
   </tr>
