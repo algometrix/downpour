@@ -2496,6 +2496,29 @@ mod tests {
     }
 
     #[test]
+    fn a_name_typed_in_the_box_keeps_the_files_extension() {
+        use crate::browser_link::tests::{item, link};
+        let file = BrowserLink::parse(BrowserDownload {
+            file_name: Some("adasf.mp4".into()),
+            ..item("https://cdn.example/get?id=7")
+        })
+        .unwrap();
+        let typed = requested_with_name_box(file, Some("hello")).unwrap();
+        assert_eq!(typed.value, "hello.mp4");
+        assert_eq!(typed.source, FileNameSource::User);
+
+        // A stream's container decides its extension when it is saved.
+        let stream = link("https://cdn.example/v/master.m3u8");
+        let typed = requested_with_name_box(stream, Some("hello")).unwrap();
+        assert_eq!(typed.value, "hello");
+
+        // `.php` is only read off the address, so a typed extension wins.
+        let guessed = link("https://cdn.example/download.php");
+        let typed = requested_with_name_box(guessed, Some("report.pdf")).unwrap();
+        assert_eq!(typed.value, "report.pdf");
+    }
+
+    #[test]
     fn a_link_without_a_name_leaves_it_to_the_engine_until_edited() {
         use crate::browser_link::tests::link;
         for url in [

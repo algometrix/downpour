@@ -143,19 +143,28 @@ impl BrowserLink {
 
     /// The name to offer in the file-info dialog.
     pub fn suggested_name(&self) -> String {
-        self.carried_name()
-            .unwrap_or_else(|| match self.stream {
-                Some(_) => FileName::guess_for_stream(&self.url),
-                None => FileName::guess_from_url(&self.url),
-            })
-            .value
+        self.suggested().value
+    }
+
+    fn suggested(&self) -> FileName {
+        self.carried_name().unwrap_or_else(|| match self.stream {
+            Some(_) => FileName::guess_for_stream(&self.url),
+            None => FileName::guess_from_url(&self.url),
+        })
     }
 
     /// What to request given the dialog's name box: anything but the offered
-    /// name is the user's own, kept literally. An empty box means no opinion.
+    /// name is the user's own. It keeps the offered file's extension (see
+    /// `FileName::typed_over`); a stream's container decides its own. An
+    /// empty box means no opinion.
     pub fn requested_name(&self, typed: &str) -> Option<FileName> {
-        FileName::from_typed(typed)
-            .filter(|name| name.value != self.suggested_name())
+        let offered = self.suggested();
+        let typed = match self.stream {
+            Some(_) => FileName::from_typed(typed),
+            None => offered.typed_over(typed),
+        };
+        typed
+            .filter(|name| name.value != offered.value)
             .or_else(|| self.carried_name())
     }
 

@@ -73,6 +73,38 @@ impl FileName {
         })
     }
 
+    /// The name someone typed over this offered one. A browser or server
+    /// knows the file's kind, so like a rename its extension stays: leaving
+    /// it in the box (`clip.mp4` or `clip.MP4`) keeps it once, and any other
+    /// dot is part of the stem (`v1.2` over `a.mp4` is `v1.2.mp4`). A guess
+    /// from the address (`download.php`) may be wrong, so a typed extension
+    /// replaces it and only a bare stem takes it. `None` when the typed text
+    /// cannot name a file.
+    pub fn typed_over(&self, typed: &str) -> Option<FileName> {
+        let typed = typed.trim();
+        let Some(offered_extension) = NameParts::of(&self.value).extension else {
+            return Self::from_typed(typed);
+        };
+        let typed_parts = NameParts::of(typed);
+        let stem = match typed_parts.extension {
+            Some(extension) if extension.eq_ignore_ascii_case(offered_extension) => {
+                typed_parts.stem
+            }
+            Some(_) if !self.knows_extension() => return Self::from_typed(typed),
+            _ => typed,
+        };
+        ChosenStem::from_typed(stem).map(|stem| stem.named_like(&self.value))
+    }
+
+    /// Whether this name's extension says what the file is, rather than
+    /// being read off the address.
+    fn knows_extension(&self) -> bool {
+        match self.source {
+            FileNameSource::User | FileNameSource::Browser | FileNameSource::Server => true,
+            FileNameSource::Guess | FileNameSource::Placeholder => false,
+        }
+    }
+
     /// The name a browser or page offers, unless nothing usable survives
     /// cleaning: `%20` names no file, so the caller should guess instead.
     pub fn from_browser(raw: &str) -> Option<Self> {
@@ -707,6 +739,45 @@ mod tests {
         assert_eq!(renamed("readme", "notes"), Some("notes".into()));
         assert_eq!(renamed("clip.mp4", "  "), None);
         assert_eq!(renamed("clip.mp4", "..."), None);
+    }
+
+    #[test]
+    fn a_name_typed_over_an_offered_one_keeps_its_extension() {
+        let typed_over = |typed, offered| {
+            FileName::new(offered, FileNameSource::Browser)
+                .typed_over(typed)
+                .map(|n| n.value)
+        };
+        assert_eq!(typed_over("hello", "adasf.mp4"), Some("hello.mp4".into()));
+        assert_eq!(
+            typed_over("hello.mp4", "adasf.mp4"),
+            Some("hello.mp4".into())
+        );
+        assert_eq!(
+            typed_over(" hello.MP4 ", "adasf.mp4"),
+            Some("hello.mp4".into())
+        );
+        assert_eq!(
+            typed_over("hello.mkv", "adasf.mp4"),
+            Some("hello.mkv.mp4".into())
+        );
+        assert_eq!(typed_over("v1.2", "adasf.mp4"), Some("v1.2.mp4".into()));
+        assert_eq!(typed_over("hello.txt", "readme"), Some("hello.txt".into()));
+        assert_eq!(typed_over(".mp4", "adasf.mp4"), Some(".mp4.mp4".into()));
+        assert_eq!(typed_over("  ", "adasf.mp4"), None);
+        let typed = FileName::new("adasf.mp4", FileNameSource::Browser)
+            .typed_over("hello")
+            .unwrap();
+        assert_eq!(typed.source, FileNameSource::User);
+    }
+
+    #[test]
+    fn a_typed_extension_replaces_one_guessed_from_the_address() {
+        let guessed = FileName::new("download.php", FileNameSource::Guess);
+        let typed_over = |typed| guessed.typed_over(typed).map(|n| n.value);
+        assert_eq!(typed_over("report.pdf"), Some("report.pdf".into()));
+        assert_eq!(typed_over("report"), Some("report.php".into()));
+        assert_eq!(typed_over("report.PHP"), Some("report.php".into()));
     }
 
     #[test]
